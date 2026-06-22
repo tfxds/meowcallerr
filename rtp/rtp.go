@@ -5,17 +5,13 @@ import (
 	"encoding/binary"
 
 	"github.com/purpshell/meowcaller/srtp"
-	"github.com/rs/zerolog"
 )
 
 // RTP WARP framing: WhatsApp's 16-byte speech / 20-byte DTX headers (extension
 // profile 0xdebe), Opus payload classifiers, and the send-side sequencer.
 
 const (
-	RtpPayloadTypeOpus uint8 = 120
-	// RtpPayloadTypeH264 is the WhatsApp video (H.264) RTP payload type, used to demux
-	// video off the relay. Source of truth: https://github.com/JotaDev66/WaCalls/blob/2d6a1f666426049a89ef9541414e771acdcf8a16/internal/voip/core/types.go#L44
-	RtpPayloadTypeH264          uint8  = 97
+	RtpPayloadTypeOpus          uint8  = 120
 	WhatsappRtpExtensionProfile uint16 = 0xdebe
 	WhatsappRtpHeaderSize       int    = 16
 	WhatsappRtpHeaderDtxSize    int    = 20
@@ -121,37 +117,30 @@ func (h *RtpHeader) ByteSize() int {
 }
 
 // RtpHeaderByteLength returns the full on-wire header size (12 + CSRC + ext); ok=false if malformed.
-func RtpHeaderByteLength(data []byte, log ...zerolog.Logger) (int, bool) {
+func RtpHeaderByteLength(data []byte) (int, bool) {
 	// Source of truth: https://github.com/oxidezap/whatsapp-rust/blob/41095d4e6ba4610e054e9ede3af1d5e88a83faee/wacore/src/voip/rtp.rs#L103-L127
-	lg := pickLog(log)
 	if len(data) < 12 {
-		lg.Trace().Int("packet_bytes", len(data)).Msg("rtp header length: packet too short for fixed header")
 		return 0, false
 	}
 	if (data[0]>>6)&0x03 != rtpVersion {
-		lg.Trace().Int("packet_bytes", len(data)).Msg("rtp header length: not version 2")
 		return 0, false
 	}
 	cc := int(data[0] & 0x0f)
 	headerLen := 12 + cc*4
 	if len(data) < headerLen {
-		lg.Trace().Int("packet_bytes", len(data)).Int("csrc_count", cc).Msg("rtp header length: packet shorter than CSRC list")
 		return 0, false
 	}
 	hasExtension := (data[0]>>4)&1 == 1
 	if hasExtension {
 		if len(data) < headerLen+4 {
-			lg.Trace().Int("packet_bytes", len(data)).Msg("rtp header length: packet shorter than extension header")
 			return 0, false
 		}
 		extWords := (int(data[headerLen+2]) << 8) | int(data[headerLen+3])
 		headerLen += 4 + extWords*4
 		if len(data) < headerLen {
-			lg.Trace().Int("packet_bytes", len(data)).Int("ext_words", extWords).Msg("rtp header length: packet shorter than extension words")
 			return 0, false
 		}
 	}
-	lg.Trace().Int("packet_bytes", len(data)).Int("header_bytes", headerLen).Int("csrc_count", cc).Bool("extension", hasExtension).Msg("rtp header length resolved")
 	return headerLen, true
 }
 
@@ -162,29 +151,24 @@ func IsRtpVersion2(data []byte) bool {
 }
 
 // ParseRtpHeader parses the fixed RTP header fields (the extension word is not decoded).
-func ParseRtpHeader(data []byte, log ...zerolog.Logger) (RtpHeader, bool) {
+func ParseRtpHeader(data []byte) (RtpHeader, bool) {
 	// Source of truth: https://github.com/oxidezap/whatsapp-rust/blob/41095d4e6ba4610e054e9ede3af1d5e88a83faee/wacore/src/voip/rtp.rs#L134-L144
-	lg := pickLog(log)
-	if _, ok := RtpHeaderByteLength(data, lg); !ok {
-		lg.Debug().Int("packet_bytes", len(data)).Msg("parse rtp header: malformed header")
+	if _, ok := RtpHeaderByteLength(data); !ok {
 		return RtpHeader{}, false
 	}
-	h := RtpHeader{
+	return RtpHeader{
 		Marker:         (data[1]>>7)&1 == 1,
 		PayloadType:    data[1] & 0x7f,
 		SequenceNumber: (uint16(data[2]) << 8) | uint16(data[3]),
 		Timestamp:      binary.BigEndian.Uint32(data[4:8]),
 		Ssrc:           binary.BigEndian.Uint32(data[8:12]),
 		ExtensionWord:  nil,
-	}
-	lg.Trace().Uint32("ssrc", h.Ssrc).Uint16("seq", h.SequenceNumber).Uint32("timestamp", h.Timestamp).Uint8("payload_type", h.PayloadType).Bool("marker", h.Marker).Msg("parsed rtp header")
-	return h, true
+	}, true
 }
 
 // EncodeRtpHeader encodes the RTP header (16 or 20 bytes with the 0xdebe extension).
-func EncodeRtpHeader(header *RtpHeader, log ...zerolog.Logger) []byte {
+func EncodeRtpHeader(header *RtpHeader) []byte {
 	// Source of truth: https://github.com/oxidezap/whatsapp-rust/blob/41095d4e6ba4610e054e9ede3af1d5e88a83faee/wacore/src/voip/rtp.rs#L146-L175
-	lg := pickLog(log)
 	size := header.ByteSize()
 	buf := make([]byte, size)
 	buf[0] = rtpVersion << 6
@@ -210,7 +194,6 @@ func EncodeRtpHeader(header *RtpHeader, log ...zerolog.Logger) []byte {
 	if size >= 20 && header.ExtensionWord != nil {
 		binary.BigEndian.PutUint32(buf[16:20], *header.ExtensionWord)
 	}
-	lg.Trace().Uint32("ssrc", header.Ssrc).Uint16("seq", header.SequenceNumber).Uint32("timestamp", header.Timestamp).Uint8("payload_type", header.PayloadType).Bool("marker", header.Marker).Bool("extension", header.ExtensionWord != nil).Int("header_bytes", size).Msg("encoded rtp header")
 	return buf
 }
 
@@ -223,20 +206,16 @@ type RtpStream struct {
 	speechStarted    bool
 	audioPacketIndex int
 	warpPiggyback    bool
-	log              zerolog.Logger
 }
 
 // NewRtpStream builds a sequencer for ssrc with samplesPerPacket per packet.
-func NewRtpStream(ssrc, samplesPerPacket uint32, warpPiggyback bool, opts ...Option) *RtpStream {
+func NewRtpStream(ssrc, samplesPerPacket uint32, warpPiggyback bool) *RtpStream {
 	// Source of truth: https://github.com/oxidezap/whatsapp-rust/blob/41095d4e6ba4610e054e9ede3af1d5e88a83faee/wacore/src/voip/rtp.rs#L189-L200
-	log := resolveConfig(opts).log
-	log.Debug().Uint32("ssrc", ssrc).Uint32("samples_per_packet", samplesPerPacket).Bool("warp_piggyback", warpPiggyback).Msg("rtp stream created")
 	return &RtpStream{
 		Ssrc:             ssrc,
 		seq:              1,
 		samplesPerPacket: samplesPerPacket,
 		warpPiggyback:    warpPiggyback,
-		log:              log,
 	}
 }
 
@@ -276,7 +255,6 @@ func (s *RtpStream) NextPacket(payload []byte, marker bool) RtpHeader {
 	}
 	s.seq++
 	s.timestamp += s.samplesPerPacket
-	s.log.Trace().Uint32("ssrc", s.Ssrc).Uint16("seq", header.SequenceNumber).Uint32("timestamp", header.Timestamp).Bool("marker", useMarker).Bool("dtx", dtx).Bool("speech", speech).Int("opus_bytes", len(payload)).Msg("rtp next packet")
 	return header
 }
 
@@ -293,6 +271,5 @@ func (s *RtpStream) NextPreSpeechPacket() RtpHeader {
 	}
 	s.seq++
 	s.timestamp += s.samplesPerPacket
-	s.log.Trace().Uint32("ssrc", s.Ssrc).Uint16("seq", header.SequenceNumber).Uint32("timestamp", header.Timestamp).Msg("rtp next pre-speech packet")
 	return header
 }
