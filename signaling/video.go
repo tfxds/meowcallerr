@@ -12,8 +12,10 @@ import (
 // 1:1 video call advertises an <video enc=h264 dec=h264 …> child in the <offer>/<accept>,
 // and an inbound video call is detected by the presence of that child. See README Credits.
 
-// VideoCodecH264 is the codec WaCalls advertises in the <video> element.
-const VideoCodecH264 = "h264"
+// VideoCodecH264 is the codec advertised in the <video> element. O telefone (WhatsApp
+// Android) oferta enc="h.264" (com ponto) / dec="H264,AV1" — usamos a MESMA string "h.264"
+// pra o match bater (era "h264" sem ponto, provável causa do peer derrubar a chamada).
+const VideoCodecH264 = "h.264"
 
 // Observed <video> "state" values. 1 = active (video on) and 11 = mid-call upgrade (carries
 // the inline media payload); the intermediate setup values (2/4/6) are unconfirmed.

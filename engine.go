@@ -287,7 +287,15 @@ func (e *engine) onOffer(ev *events.CallOffer) {
 	e.applyVoipSettingsCodec(m, ev.Data, ev.CallID)
 	e.mu.Unlock()
 	if isVideo {
-		e.c.log.Info().Str("call_id", ev.CallID).Msg("inbound call advertises video")
+		// DIAG: loga o codec que o telefone ofereceu no <video> (enc/dec) — pra saber se é
+		// H.264 (o que o meowcaller usa) ou VP8 (e o accept H.264 causaria o terminate).
+		var venc, vdec string
+		if vNode := findChild(ev.Data, "video"); vNode != nil {
+			vag := vNode.AttrGetter()
+			venc = vag.OptionalString("enc")
+			vdec = vag.OptionalString("dec")
+		}
+		e.c.log.Info().Str("call_id", ev.CallID).Str("video_enc", venc).Str("video_dec", vdec).Msg("inbound call advertises video")
 	}
 
 	// Preaccept eagerly: it is a preparation step, done independently of the later
@@ -356,17 +364,13 @@ func (e *engine) sendAccept(callID string, to, creator types.JID) {
 		return
 	}
 	m.acceptPending = false
+	isVideo := m.isVideo
 	e.mu.Unlock()
 
-	// NOTA (vídeo PAUSADO): aceitar com <video> (Video: m.isVideo) faz o peer abrir a câmera
-	// e derrubar a chamada ~1s depois — o from-start inbound video do meowcaller (NOT
-	// VALIDATED) tem peças de sinalização faltando além do <video state=1> (provável codec
-	// H.264 vs o ofertado e/ou validação de chave no accept). Até resolver, aceitamos
-	// vídeo-chamada como ÁUDIO (Video:false) pra a chamada ficar de pé. Roadmap na memória
-	// project_whatsmeow_video_wip.
 	accept := signaling.BuildAccept(&signaling.AcceptParams{
 		CallID: callID, To: to, CallCreator: creator,
 		AudioRates: []string{"16000"},
+		Video:      isVideo,
 		Metadata:   waBinary.Attrs{"peer_abtest_bucket_id_list": "125208,94276"},
 	})
 	accept.Attrs["id"] = e.c.wa.DangerousInternals().GenerateRequestID()
@@ -375,6 +379,18 @@ func (e *engine) sendAccept(callID string, to, creator types.JID) {
 		return
 	}
 	e.c.log.Info().Str("call_id", callID).Msg("accepted (after mute_v2)")
+
+	// Vídeo from-start: depois do accept com <video>, o peer espera o callee mandar
+	// <video state=1> ("câmera pronta"). Sem isso o peer dá timeout em ~1s e derruba.
+	if isVideo {
+		ready := signaling.BuildVideoState(callID, to, creator, e.c.wa.GenerateMessageID(),
+			signaling.VideoStateActive, 0, signaling.VideoCodecH264)
+		if err := e.c.wa.DangerousInternals().SendNode(context.Background(), ready); err != nil {
+			e.c.log.Warn().Err(err).Str("call_id", callID).Msg("send <video state=1> failed")
+		} else {
+			e.c.log.Info().Str("call_id", callID).Msg("sent <video state=1> (callee video-ready)")
+		}
+	}
 }
 
 // reject declines an inbound call.
