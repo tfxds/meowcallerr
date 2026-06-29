@@ -145,7 +145,22 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	if err != nil {
 		return err
 	}
-	ssrcList := stun.BuildWasmSsrcSubscriptionList([]uint32{ssrc}, []uint32{peerSsrc}, 0, 0)
+	// SSRC de vídeo (slot 2): numa chamada de VÍDEO o relay também precisa que a gente
+	// assine o SSRC de vídeo do peer (igual o de áudio), senão não bria o vídeo do peer.
+	e.mu.Lock()
+	mcCall := e.calls[callID]
+	isInbound := mcCall != nil && mcCall.direction == CallDirectionIncoming
+	isVideoCall := mcCall != nil && mcCall.isVideo
+	e.mu.Unlock()
+	selfList, peerList := []uint32{ssrc}, []uint32{peerSsrc}
+	var peerVideoSsrc uint32
+	if isVideoCall {
+		selfVideoSsrc, _ := rtp.DeriveWasmParticipantSsrc(callID, rtp.FormatE2ESrtpParticipantID(selfLID), rtp.VideoSlotWord, log)
+		peerVideoSsrc, _ = rtp.DeriveWasmParticipantSsrc(callID, rtp.FormatE2ESrtpParticipantID(peerLID), rtp.VideoSlotWord, log)
+		selfList = append(selfList, selfVideoSsrc)
+		peerList = append(peerList, peerVideoSsrc)
+	}
+	ssrcList := stun.BuildWasmSsrcSubscriptionList(selfList, peerList, 0, 0)
 
 	ch, allocate, err := e.connectAndAllocate(ctx, rd, ssrcList)
 	if err != nil {
@@ -173,11 +188,6 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	// outbound works). The synthetic ICE ufrag is base64(selected auth_token), paired with a
 	// random local ufrag; authenticated with the relay <key>. Burst over the first ~5s and
 	// refreshed on the keepalive. Ported from WaCalls.
-	e.mu.Lock()
-	mcCall := e.calls[callID]
-	isInbound := mcCall != nil && mcCall.direction == CallDirectionIncoming
-	e.mu.Unlock()
-
 	var consentUsername string
 	if ep := getMediaRelayEndpoint(rd); ep != nil && int(ep.authTokenID) < len(rd.authTokens) && rd.authTokens[ep.authTokenID] != nil {
 		authUfrag := base64.StdEncoding.EncodeToString(rd.authTokens[ep.authTokenID])
@@ -192,6 +202,11 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		var btx [12]byte
 		_, _ = rand.Read(btx[:])
 		_, _ = ch.Send(stun.BuildIceConsentBindingRequest(btx, consentUsername, peerSsrc, rd.relayKeyASCII, log))
+		// Vídeo: assina TAMBÉM o SSRC de vídeo do peer (senão o relay não bria o vídeo).
+		if isVideoCall && peerVideoSsrc != 0 {
+			_, _ = rand.Read(btx[:])
+			_, _ = ch.Send(stun.BuildIceConsentBindingRequest(btx, consentUsername, peerVideoSsrc, rd.relayKeyASCII, log))
+		}
 	}
 	if isInbound && consentUsername != "" {
 		log.Debug().Str("peer_ssrc", fmt.Sprintf("0x%08x", peerSsrc)).Msg("inbound: sending callee ICE-consent (peer subscription)")

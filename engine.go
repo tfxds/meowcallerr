@@ -358,6 +358,12 @@ func (e *engine) sendAccept(callID string, to, creator types.JID) {
 	m.acceptPending = false
 	e.mu.Unlock()
 
+	// NOTA (vídeo PAUSADO): aceitar com <video> (Video: m.isVideo) faz o peer abrir a câmera
+	// e derrubar a chamada ~1s depois — o from-start inbound video do meowcaller (NOT
+	// VALIDATED) tem peças de sinalização faltando além do <video state=1> (provável codec
+	// H.264 vs o ofertado e/ou validação de chave no accept). Até resolver, aceitamos
+	// vídeo-chamada como ÁUDIO (Video:false) pra a chamada ficar de pé. Roadmap na memória
+	// project_whatsmeow_video_wip.
 	accept := signaling.BuildAccept(&signaling.AcceptParams{
 		CallID: callID, To: to, CallCreator: creator,
 		AudioRates: []string{"16000"},
