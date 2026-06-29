@@ -188,24 +188,46 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	// outbound works). The synthetic ICE ufrag is base64(selected auth_token), paired with a
 	// random local ufrag; authenticated with the relay <key>. Burst over the first ~5s and
 	// refreshed on the keepalive. Ported from WaCalls.
-	var consentUsername string
+	// WaCalls manda 3 binding-requests por resend: (1) ufrag = base64(auth_token):local,
+	// (2) ufrag = base64(token):local (quando difere), (3) BARE sem auth. Só o (1) — que era o
+	// que o fork mandava — fazia o relay bridar um burst curto e parar. Replicado de WaCalls
+	// internal/voip/transport/sctprelay.go send().
+	var consentUsername, consentUsernameToken string
 	if ep := getMediaRelayEndpoint(rd); ep != nil && int(ep.authTokenID) < len(rd.authTokens) && rd.authTokens[ep.authTokenID] != nil {
-		authUfrag := base64.StdEncoding.EncodeToString(rd.authTokens[ep.authTokenID])
 		var lb [9]byte
 		_, _ = rand.Read(lb[:])
-		consentUsername = authUfrag + ":" + base64.RawURLEncoding.EncodeToString(lb[:])
+		localUfrag := base64.RawURLEncoding.EncodeToString(lb[:])
+		authUfrag := base64.StdEncoding.EncodeToString(rd.authTokens[ep.authTokenID])
+		consentUsername = authUfrag + ":" + localUfrag
+		if int(ep.tokenID) < len(rd.relayTokens) && rd.relayTokens[ep.tokenID] != nil {
+			tokenUfrag := base64.StdEncoding.EncodeToString(rd.relayTokens[ep.tokenID])
+			if tokenUfrag != authUfrag {
+				consentUsernameToken = tokenUfrag + ":" + localUfrag
+			}
+		}
 	}
 	sendConsent := func() {
 		if consentUsername == "" {
 			return
 		}
 		var btx [12]byte
+		// (1) autenticado com ufrag do auth_token
 		_, _ = rand.Read(btx[:])
 		_, _ = ch.Send(stun.BuildIceConsentBindingRequest(btx, consentUsername, peerSsrc, rd.relayKeyASCII, log))
-		// Vídeo: assina TAMBÉM o SSRC de vídeo do peer (senão o relay não bria o vídeo).
+		// (2) autenticado com ufrag do token (quando difere do auth_token)
+		if consentUsernameToken != "" {
+			_, _ = rand.Read(btx[:])
+			_, _ = ch.Send(stun.BuildIceConsentBindingRequest(btx, consentUsernameToken, peerSsrc, rd.relayKeyASCII, log))
+		}
+		// (3) BARE — sem username/MI/fingerprint (a variante que faltava)
+		_, _ = rand.Read(btx[:])
+		_, _ = ch.Send(stun.BuildBareSenderSubscriptionRequest(btx, peerSsrc, log))
+		// Vídeo: assina TAMBÉM o SSRC de vídeo do peer (autenticado + bare).
 		if isVideoCall && peerVideoSsrc != 0 {
 			_, _ = rand.Read(btx[:])
 			_, _ = ch.Send(stun.BuildIceConsentBindingRequest(btx, consentUsername, peerVideoSsrc, rd.relayKeyASCII, log))
+			_, _ = rand.Read(btx[:])
+			_, _ = ch.Send(stun.BuildBareSenderSubscriptionRequest(btx, peerVideoSsrc, log))
 		}
 	}
 	if isInbound && consentUsername != "" {
@@ -262,6 +284,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	// relayRx counts packets received from the relay, so the silence watchdog can warn if
 	// the relay never answers our allocate.
 	var relayRx atomic.Uint64
+	var bindReqIn atomic.Uint64 // [RX-DIAG] binding-requests recebidos do relay (consent freshness)
 
 	// Inbound calls are torn down by the caller within ~400ms if the relay bind never
 	// comes alive; check at 400ms and 900ms and say so explicitly.
@@ -304,6 +327,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 				sendConsent() // mantém viva a consent/subscrição do peer (callee) a cada keepalive
 			}
 			tickCount++
+			log.Info().Uint64("tick", tickCount).Uint64("relay_rx", relayRx.Load()).Uint64("bind_req_in", bindReqIn.Load()).Bool("inbound", isInbound).Msg("[RX-DIAG] keepalive tick")
 			e.c.diag.Emit("stun", map[string]any{
 				"event": "keepalive", "tick": tickCount,
 				"tx_id_hex": hex.EncodeToString(tx[:]), "ping_hex": hex.EncodeToString(ping[:]),
@@ -419,6 +443,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		if !isRTP {
 			mt, isStun := stun.StunMessageType(pkt)
 			if isStun && mt == stun.MsgBindingRequest {
+				bindReqIn.Add(1)
 				if txid, ok := stun.StunTransactionID(pkt); ok && len(txid) == 12 {
 					var tx [12]byte
 					copy(tx[:], txid)
@@ -434,8 +459,10 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 			}
 			continue
 		}
-		if rtpSeen++; rtpSeen == 1 {
-			log.Info().Int("bytes", n).Msg("first RTP-classified packet from relay, relay is bridging the peer's media")
+		if rtpSeen++; rtpSeen == 1 || rtpSeen%200 == 0 {
+			if vh, ok := rtp.ParseRtpHeader(pkt); ok {
+				log.Info().Uint64("rtp_seen", rtpSeen).Str("rx_ssrc", fmt.Sprintf("0x%08x", vh.Ssrc)).Uint8("pt", vh.PayloadType).Msg("[RX-DIAG] RTP-classified packet from relay")
+			}
 		}
 		// Demux: H.264 (PT 97) is the peer's video; route it to the video pipeline and
 		// reassemble Annex-B access units, emitting each on the RTP marker bit. Anything else
@@ -486,11 +513,14 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 			"seq": hdr.SequenceNumber, "samples": len(frame),
 			"pcm_rms": rmsFloat32(frame), "payload_len": len(payload),
 		})
-		if _, sink := callPlayerSink(call); sink != nil {
+		_, sink := callPlayerSink(call)
+		if sink != nil {
 			_ = sink.WriteFrame(frame)
 		}
-		if rtpIn++; rtpIn == 1 {
-			log.Info().Msg("first RTP decoded from relay, inbound audio flowing")
+		if rtpIn++; rtpIn == 1 || rtpIn%250 == 0 {
+			log.Info().Uint64("rtp_in", rtpIn).Uint64("rtp_seen", rtpSeen).Str("rx_ssrc", fmt.Sprintf("0x%08x", hdr.Ssrc)).Str("want_peer_ssrc", fmt.Sprintf("0x%08x", peerSsrc)).Bool("sink_attached", sink != nil).Msg("[RX-DIAG] inbound audio decode tick")
+		}
+		if rtpIn == 1 {
 			e.c.diag.Emit("meta", map[string]any{"event": "first_rtp_in", "call_id": callID})
 			if call != nil {
 				call.setPhase(CallPhaseActive)

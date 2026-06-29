@@ -56,6 +56,21 @@ func BuildIceConsentBindingRequest(transactionID [12]byte, username string, subs
 	return EncodeStunRequest(MsgBindingRequest, transactionID, attrs, integrityKey, true, lg)
 }
 
+// BuildBareSenderSubscriptionRequest builds a binding-request carrying ONLY a PRIORITY attr
+// and the sender-subscription (attr 0x4000) — no USERNAME, no MESSAGE-INTEGRITY, no
+// ICE-CONTROLLING, no FINGERPRINT. WaCalls sends this UNauthenticated variant alongside the
+// authenticated ones (BuildBindingRequestWithSubs(nil,nil,subs,false,false)) so the relay
+// registers the peer subscription; the authenticated-only path bridged just a brief burst.
+// Source of truth: https://github.com/JotaDev66/WaCalls internal/voip/transport/sctprelay.go send()
+func BuildBareSenderSubscriptionRequest(transactionID [12]byte, subscriptionSsrc uint32, log ...zerolog.Logger) []byte {
+	lg := pickLog(log)
+	var priority [4]byte
+	binary.BigEndian.PutUint32(priority[:], 16_777_215)
+	attrs := stunAttr(attrPriority, priority[:])
+	attrs = append(attrs, stunAttr(attrRelayToken, CreateVoipSenderSubscriptions(subscriptionSsrc))...)
+	return EncodeStunRequest(MsgBindingRequest, transactionID, attrs, nil, false, lg)
+}
+
 // STUN message types.
 const (
 	MsgBindingRequest  uint16 = 0x0001
