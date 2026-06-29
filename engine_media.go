@@ -284,7 +284,6 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	// relayRx counts packets received from the relay, so the silence watchdog can warn if
 	// the relay never answers our allocate.
 	var relayRx atomic.Uint64
-	var bindReqIn atomic.Uint64 // [RX-DIAG] binding-requests recebidos do relay (consent freshness)
 
 	// Inbound calls are torn down by the caller within ~400ms if the relay bind never
 	// comes alive; check at 400ms and 900ms and say so explicitly.
@@ -327,7 +326,6 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 				sendConsent() // mantém viva a consent/subscrição do peer (callee) a cada keepalive
 			}
 			tickCount++
-			log.Info().Uint64("tick", tickCount).Uint64("relay_rx", relayRx.Load()).Uint64("bind_req_in", bindReqIn.Load()).Bool("inbound", isInbound).Msg("[RX-DIAG] keepalive tick")
 			e.c.diag.Emit("stun", map[string]any{
 				"event": "keepalive", "tick": tickCount,
 				"tx_id_hex": hex.EncodeToString(tx[:]), "ping_hex": hex.EncodeToString(ping[:]),
@@ -443,7 +441,6 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		if !isRTP {
 			mt, isStun := stun.StunMessageType(pkt)
 			if isStun && mt == stun.MsgBindingRequest {
-				bindReqIn.Add(1)
 				if txid, ok := stun.StunTransactionID(pkt); ok && len(txid) == 12 {
 					var tx [12]byte
 					copy(tx[:], txid)
@@ -459,10 +456,8 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 			}
 			continue
 		}
-		if rtpSeen++; rtpSeen == 1 || rtpSeen%200 == 0 {
-			if vh, ok := rtp.ParseRtpHeader(pkt); ok {
-				log.Info().Uint64("rtp_seen", rtpSeen).Str("rx_ssrc", fmt.Sprintf("0x%08x", vh.Ssrc)).Uint8("pt", vh.PayloadType).Msg("[RX-DIAG] RTP-classified packet from relay")
-			}
+		if rtpSeen++; rtpSeen == 1 {
+			log.Info().Int("bytes", n).Msg("first RTP-classified packet from relay, relay is bridging the peer's media")
 		}
 		// Demux: H.264 (PT 97) is the peer's video; route it to the video pipeline and
 		// reassemble Annex-B access units, emitting each on the RTP marker bit. Anything else
@@ -513,14 +508,11 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 			"seq": hdr.SequenceNumber, "samples": len(frame),
 			"pcm_rms": rmsFloat32(frame), "payload_len": len(payload),
 		})
-		_, sink := callPlayerSink(call)
-		if sink != nil {
+		if _, sink := callPlayerSink(call); sink != nil {
 			_ = sink.WriteFrame(frame)
 		}
-		if rtpIn++; rtpIn == 1 || rtpIn%250 == 0 {
-			log.Info().Uint64("rtp_in", rtpIn).Uint64("rtp_seen", rtpSeen).Str("rx_ssrc", fmt.Sprintf("0x%08x", hdr.Ssrc)).Str("want_peer_ssrc", fmt.Sprintf("0x%08x", peerSsrc)).Bool("sink_attached", sink != nil).Msg("[RX-DIAG] inbound audio decode tick")
-		}
-		if rtpIn == 1 {
+		if rtpIn++; rtpIn == 1 {
+			log.Info().Msg("first RTP decoded from relay, inbound audio flowing")
 			e.c.diag.Emit("meta", map[string]any{"event": "first_rtp_in", "call_id": callID})
 			if call != nil {
 				call.setPhase(CallPhaseActive)
