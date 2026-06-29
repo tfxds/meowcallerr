@@ -209,7 +209,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		}
 	}
 	if isInbound && consentUsername != "" {
-		log.Debug().Str("peer_ssrc", fmt.Sprintf("0x%08x", peerSsrc)).Msg("inbound: sending callee ICE-consent (peer subscription)")
+		log.Info().Bool("video", isVideoCall).Str("peer_ssrc", fmt.Sprintf("0x%08x", peerSsrc)).Str("peer_video_ssrc", fmt.Sprintf("0x%08x", peerVideoSsrc)).Msg("inbound: sending callee ICE-consent (audio+video subscription)")
 		sendConsent()
 		for _, d := range []time.Duration{50, 150, 300, 500, 1000, 2000, 3000, 5000} {
 			delay := d * time.Millisecond
