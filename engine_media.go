@@ -511,8 +511,10 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		if _, sink := callPlayerSink(call); sink != nil {
 			_ = sink.WriteFrame(frame)
 		}
-		if rtpIn++; rtpIn == 1 {
-			log.Info().Msg("first RTP decoded from relay, inbound audio flowing")
+		if rtpIn++; rtpIn == 1 || rtpIn%1000 == 0 {
+			log.Info().Uint64("frames", rtpIn).Msg("inbound audio flowing (peer→sistema)")
+		}
+		if rtpIn == 1 {
 			e.c.diag.Emit("meta", map[string]any{"event": "first_rtp_in", "call_id": callID})
 			if call != nil {
 				call.setPhase(CallPhaseActive)
