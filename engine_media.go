@@ -194,7 +194,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		_, _ = ch.Send(stun.BuildIceConsentBindingRequest(btx, consentUsername, peerSsrc, rd.relayKeyASCII, log))
 	}
 	if isInbound && consentUsername != "" {
-		log.Info().Str("peer_ssrc", fmt.Sprintf("0x%08x", peerSsrc)).Str("consent_user", consentUsername).Msg("INBOUND: enviando ICE-consent binding-request")
+		log.Debug().Str("peer_ssrc", fmt.Sprintf("0x%08x", peerSsrc)).Msg("inbound: sending callee ICE-consent (peer subscription)")
 		sendConsent()
 		for _, d := range []time.Duration{50, 150, 300, 500, 1000, 2000, 3000, 5000} {
 			delay := d * time.Millisecond
