@@ -304,14 +304,10 @@ func (e *engine) onOffer(ev *events.CallOffer) {
 		e.c.log.Info().Str("call_id", ev.CallID).Str("video_enc", venc).Str("video_dec", vdec).Msg("inbound call advertises video")
 	}
 
-	// Preaccept eagerly: it is a preparation step, done independently of the later
-	// Answer/Reject decision. It keeps the offer alive and joins the relay election while
-	// the integrator decides — even a call the user goes on to decline has usually already
-	// been preaccepted.
-	if err := e.sendPreaccept(ev.CallID, ev.From, ev.CallCreator); err != nil {
-		e.c.log.Warn().Err(err).Str("call_id", ev.CallID).Msg("preaccept failed")
-	}
-
+	// NÃO preaccepta na chegada do offer: o <preaccept> faz o WhatsApp tratar a chamada como
+	// "atendida por um device" e o celular do CHAMADOR PARA DE TOCAR antes do atendente pegar.
+	// O preaccept agora vai em answer() (no pickup real do atendente). O celular toca normal
+	// (toque nativo) até alguém atender no sistema.
 	if fn := e.c.incomingCallHandler(); fn != nil {
 		fn(call)
 	}
@@ -350,6 +346,11 @@ func (e *engine) answer(c *Call) error {
 	m := e.lookup(c.id)
 	if m == nil {
 		return fmt.Errorf("meowcaller: unknown call %s", c.id)
+	}
+	// Preaccept AGORA (no pickup), não na chegada do offer — assim o celular do chamador toca
+	// até o atendente pegar de verdade. Aqui já temos from/creator (setados no onOffer).
+	if err := e.sendPreaccept(c.id, m.from, m.creator); err != nil {
+		e.c.log.Warn().Err(err).Str("call_id", c.id).Msg("preaccept (no pickup) falhou")
 	}
 	e.mu.Lock()
 	m.acceptPending = true
