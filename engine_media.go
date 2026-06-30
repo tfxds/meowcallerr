@@ -368,7 +368,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	// Binding-requests instead flip the relay into ICE-consent mode and the bridge never
 	// forms.
 	go func() {
-		t := time.NewTicker(time.Second)
+		t := time.NewTicker(1100 * time.Millisecond) // WaCalls relayKeepaliveInterval
 		defer t.Stop()
 		var tickCount uint64
 		for {
@@ -380,15 +380,24 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 			var tx [12]byte
 			_, _ = rand.Read(tx[:])
 			ping := stun.BuildWhatsappPing(tx, log)
-			subMu.Lock()
-			al := curAllocate
-			subMu.Unlock()
-			if _, err := ch.Send(al); err != nil {
-				return
-			}
-			_, _ = ch.Send(ping[:])
 			if isInbound {
-				sendConsent() // mantém viva a consent/subscrição do peer (callee) a cada keepalive
+				// INBOUND (callee): keepalive = SÓ o ping (0x0801), igual WaCalls startKeepalive.
+				// A assinatura (binding-requests + allocate) vai SÓ no burst inicial (50-5000ms) e
+				// PARA. Mandar binding-requests todo segundo mantinha o relay em "modo ICE-consent"
+				// e ele NUNCA assentava o stream contínuo (1 pacote e morria — o próprio comentário
+				// do recipe avisava disso). WaCalls: burst e para; keepalive = ping puro.
+				if _, err := ch.Send(ping[:]); err != nil {
+					return
+				}
+			} else {
+				// OUTBOUND (caller): allocate + ping (recipe validado, RX vem de graça).
+				subMu.Lock()
+				al := curAllocate
+				subMu.Unlock()
+				if _, err := ch.Send(al); err != nil {
+					return
+				}
+				_, _ = ch.Send(ping[:])
 			}
 			tickCount++
 			e.c.diag.Emit("stun", map[string]any{
