@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -54,7 +55,7 @@ func (e *engine) maybeStartMedia(callID string) {
 // the channel and the allocate bytes (re-sent by the keepalive).
 //
 // NOT VALIDATED: live-relay only.
-func (e *engine) connectAndAllocate(ctx context.Context, rd *relayData, ssrcList []byte) (*relay.RelayMediaChannel, []byte, error) {
+func (e *engine) connectAndAllocate(ctx context.Context, rd *relayData, ssrcList []byte) (relay.RelayChannel, []byte, error) {
 	log := e.c.log
 	ep := getMediaRelayEndpoint(rd)
 	if ep == nil || len(ep.addresses) == 0 {
@@ -68,15 +69,38 @@ func (e *engine) connectAndAllocate(ctx context.Context, rd *relayData, ssrcList
 	})
 
 	type result struct {
-		ch  *relay.RelayMediaChannel
+		ch  relay.RelayChannel
 		err error
 	}
 	done := make(chan result, 1)
+	// Escolhe o transporte por env: pion (ICE-consent automático/completo) vs manual
+	// (hand-rolled, comportamento atual). Com WHATSMEOW_PION_RELAY desligado o caminho é
+	// IDÊNTICO ao de hoje.
+	usePion := os.Getenv("WHATSMEOW_PION_RELAY") == "1"
 	go func() {
+		if usePion {
+			// Credenciais ICE pro munge do SDP do relay: ufrag = base64(auth_token)
+			// selecionado (fallback base64(token)) e pwd = <key> ASCII do relay. São as
+			// mesmas usadas no ICE-consent manual em runMedia.
+			ufrag := ""
+			if int(ep.authTokenID) < len(rd.authTokens) && rd.authTokens[ep.authTokenID] != nil {
+				ufrag = base64.StdEncoding.EncodeToString(rd.authTokens[ep.authTokenID])
+			} else if int(ep.tokenID) < len(rd.relayTokens) && rd.relayTokens[ep.tokenID] != nil {
+				ufrag = base64.StdEncoding.EncodeToString(rd.relayTokens[ep.tokenID])
+			}
+			pwd := string(rd.relayKeyASCII)
+			log.Info().Bool("has_ice_ufrag", ufrag != "").Msg("connecting media transport via pion (WHATSMEOW_PION_RELAY=1)")
+			ch, err := relay.ConnectRelayMediaPion(addr,
+				relay.WithLogger(log),
+				relay.WithRelayICECredentials(ufrag, pwd),
+			)
+			done <- result{ch, err}
+			return
+		}
 		ch, err := relay.ConnectRelayMedia(addr, relay.WithLogger(log))
 		done <- result{ch, err}
 	}()
-	var ch *relay.RelayMediaChannel
+	var ch relay.RelayChannel
 	select {
 	case r := <-done:
 		if r.err != nil {
@@ -568,7 +592,7 @@ const videoRtpStepSamples = 90000 / 15
 type videoSender struct {
 	mu      sync.Mutex
 	pipe    *MediaPipeline
-	ch      *relay.RelayMediaChannel
+	ch      relay.RelayChannel
 	ssrc    uint32
 	seq     uint16
 	ts      uint32

@@ -61,6 +61,19 @@ func ClassifyRelayPacket(data []byte, log ...zerolog.Logger) RelayPacketKind {
 	return RelayPacketStun
 }
 
+// RelayChannel é o contrato comum dos transportes de mídia do relay. Tanto o transporte
+// manual (*RelayMediaChannel) quanto o baseado em pion/webrtc (ConnectRelayMediaPion) o
+// satisfazem, permitindo ao engine escolher a implementação em runtime sem alterar o loop
+// de mídia. STUN/RTP/RTCP trafegam como mensagens binárias de DataChannel.
+type RelayChannel interface {
+	// Send escreve um pacote de mídia/STUN como uma mensagem binária de DataChannel.
+	Send(data []byte) (int, error)
+	// Recv lê uma mensagem de DataChannel para buf, retornando o tamanho.
+	Recv(buf []byte) (int, error)
+	// Close derruba toda a stack de transporte.
+	Close() error
+}
+
 // CallTransportError categorizes a relay-transport failure so a consumer can branch:
 // Connect is fatal (the call can't reach the relay); Send/Recv are recoverable on an
 // established channel.
