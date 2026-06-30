@@ -796,7 +796,10 @@ func (e *engine) runMediaWacalls(ctx context.Context, callID string, call *Call,
 	var configs []wacallsrelay.RelayConfig
 	for i := range rd.endpoints {
 		ep := &rd.endpoints[i]
-		if ep.isFNA || len(ep.addresses) == 0 {
+		// NÃO filtra isFNA — o WaCalls (buildRelayConfigs) conecta em TODOS os endpoints do
+		// offer, inclusive FNA. O peer pode mandar a mídia justamente no relay FNA; pular ele
+		// = perder o stream (filete). Só pula sem endereço ou sem token.
+		if len(ep.addresses) == 0 {
 			continue
 		}
 		if int(ep.tokenID) >= len(rd.relayTokens) || rd.relayTokens[ep.tokenID] == nil {
@@ -821,6 +824,7 @@ func (e *engine) runMediaWacalls(ctx context.Context, callID string, call *Call,
 	if len(configs) == 0 {
 		return fmt.Errorf("wacalls relay: nenhum endpoint usável")
 	}
+	log.Info().Int("offer_endpoints", len(rd.endpoints)).Int("configs", len(configs)).Msg("[WACALLS] endpoints do offer vs configs (multi-relay)")
 
 	enc := mlow.NewMlowEncoder(mlow.WithLogger(log))
 	dec := mlow.NewMlowDecoder(mlow.WithLogger(log))
