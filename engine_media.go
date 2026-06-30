@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"math"
 	"net"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"github.com/purpshell/meowcaller/relay"
 	"github.com/purpshell/meowcaller/rtp"
 	"github.com/purpshell/meowcaller/stun"
+	"github.com/purpshell/meowcaller/wacallsrelay"
 )
 
 // The live-relay media loop: connect+allocate to the elected relay, then run the
@@ -38,6 +40,7 @@ func (e *engine) maybeStartMedia(callID string) {
 	m.cancel = cancel
 	call := m.call
 	callKey, selfLID, peerLID, rd := m.callKey, m.selfLID, m.peerLID, m.relay
+	isInbound := m.direction == CallDirectionIncoming
 	e.mu.Unlock()
 
 	if call != nil {
@@ -45,6 +48,15 @@ func (e *engine) maybeStartMedia(callID string) {
 	}
 	e.c.log.Info().Str("call_id", callID).Msg("starting media")
 	go func() {
+		// PATH B (flag WHATSMEOW_WACALLS_RELAY=1, só inbound): usa o SctpRelayManager portado
+		// do WaCalls (multi-relay pion — conecta em TODOS os relays do offer) no lugar do
+		// transporte single-relay. Aditivo: outbound e o caminho normal ficam intactos.
+		if isInbound && os.Getenv("WHATSMEOW_WACALLS_RELAY") == "1" {
+			if err := e.runMediaWacalls(mctx, callID, call, callKey, selfLID, peerLID, rd); err != nil {
+				e.c.log.Warn().Err(err).Str("call_id", callID).Msg("media (wacalls) ended")
+			}
+			return
+		}
 		if err := e.runMedia(mctx, callID, call, callKey, selfLID, peerLID, rd); err != nil {
 			e.c.log.Warn().Err(err).Str("call_id", callID).Msg("media ended")
 		}
@@ -757,6 +769,151 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 				}
 			}
 		}
+	}
+}
+
+// runMediaWacalls é o caminho de mídia do PATH B: usa o SctpRelayManager portado do WaCalls
+// (multi-relay pion — conecta em TODOS os relays do offer, broadcast TX, merge RX) no lugar do
+// transporte single-relay do runMedia. Mantém o MESMO pipeline E2E-SRTP/MLow do fork. O pion
+// cuida do ICE-consent automaticamente, então NÃO respondemos binding-requests à mão. RX:
+// ignora STUN, decodifica RTP de áudio do peer; na 1ª chega o SSRC real → re-assina (actualPeerSet).
+//
+// NOT VALIDATED: caminho novo atrás da flag WHATSMEOW_WACALLS_RELAY.
+func (e *engine) runMediaWacalls(ctx context.Context, callID string, call *Call, callKey []byte, selfLID, peerLID string, rd *relayData) error {
+	log := e.c.log
+
+	ssrc, err := rtp.DeriveWasmParticipantSsrc(callID, rtp.FormatE2ESrtpParticipantID(selfLID), 0, log)
+	if err != nil {
+		return err
+	}
+	peerSsrc, err := rtp.DeriveWasmParticipantSsrc(callID, rtp.FormatE2ESrtpParticipantID(peerLID), 0, log)
+	if err != nil {
+		return err
+	}
+
+	// Monta RelayConfig pra TODOS os endpoints do offer (o ponto do WaCalls é o multi-relay).
+	// Token/AuthToken são base64 dos tokens crus (igual WaCalls relayack.go); Key = relay <key>.
+	var configs []wacallsrelay.RelayConfig
+	for i := range rd.endpoints {
+		ep := &rd.endpoints[i]
+		if ep.isFNA || len(ep.addresses) == 0 {
+			continue
+		}
+		if int(ep.tokenID) >= len(rd.relayTokens) || rd.relayTokens[ep.tokenID] == nil {
+			continue
+		}
+		cfg := wacallsrelay.RelayConfig{
+			IP:          ep.addresses[0].ipv4,
+			Port:        int(ep.addresses[0].port),
+			Token:       base64.StdEncoding.EncodeToString(rd.relayTokens[ep.tokenID]),
+			RawToken:    rd.relayTokens[ep.tokenID],
+			Key:         string(rd.relayKeyASCII),
+			RelayID:     int(ep.relayID),
+			Name:        ep.relayName,
+			AuthTokenID: fmt.Sprint(ep.authTokenID),
+		}
+		if int(ep.authTokenID) < len(rd.authTokens) && rd.authTokens[ep.authTokenID] != nil {
+			cfg.AuthToken = base64.StdEncoding.EncodeToString(rd.authTokens[ep.authTokenID])
+			cfg.RawAuthToken = rd.authTokens[ep.authTokenID]
+		}
+		configs = append(configs, cfg)
+	}
+	if len(configs) == 0 {
+		return fmt.Errorf("wacalls relay: nenhum endpoint usável")
+	}
+
+	enc := mlow.NewMlowEncoder(mlow.WithLogger(log))
+	dec := mlow.NewMlowDecoder(mlow.WithLogger(log))
+	txPipe, err := NewMediaPipeline(callKey, selfLID, peerLID, ssrc, FrameSamples, WithLogger(log))
+	if err != nil {
+		return err
+	}
+	rxPipe, err := NewMediaPipeline(callKey, selfLID, peerLID, ssrc, FrameSamples, WithLogger(log))
+	if err != nil {
+		return err
+	}
+
+	mgr := wacallsrelay.NewSctpRelayManager(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	mgr.SetSsrc(ssrc)
+	mgr.SetSubscriptionSsrc(peerSsrc)
+	defer mgr.Cleanup()
+
+	var rtpIn, rtpSeen, nonRtp atomic.Uint64
+	var actualPeerSet atomic.Bool
+	defer func() {
+		log.Info().Uint64("relays", uint64(len(configs))).Uint64("rtpSeen", rtpSeen.Load()).
+			Uint64("nonRtp", nonRtp.Load()).Uint64("rtpIn", rtpIn.Load()).
+			Msg("[WACALLS-SUMMARY] recebidos-RTP vs nao-RTP vs decodificados")
+	}()
+
+	mgr.SetOnReceive(func(data []byte) {
+		if wacallsrelay.IsStunPacket(data) {
+			nonRtp.Add(1)
+			return
+		}
+		if !wacallsrelay.IsRtpPacket(data) || len(data) < 12 {
+			nonRtp.Add(1)
+			return
+		}
+		rtpSeen.Add(1)
+		rxSsrc := uint32(data[8])<<24 | uint32(data[9])<<16 | uint32(data[10])<<8 | uint32(data[11])
+		if rxSsrc == ssrc {
+			return // nosso próprio stream ecoado
+		}
+		// actualPeerSet: 1º pacote real do peer → re-assina o SSRC real (WaCalls onRelayData).
+		if actualPeerSet.CompareAndSwap(false, true) && rxSsrc != peerSsrc {
+			log.Info().Str("derivado", fmt.Sprintf("0x%08x", peerSsrc)).Str("real", fmt.Sprintf("0x%08x", rxSsrc)).Msg("[WACALLS] re-assinando SSRC REAL do peer")
+			mgr.SetSubscriptionSsrc(rxSsrc)
+			go mgr.ResendSubscriptions()
+		}
+		_, payload, ok := rxPipe.UnprotectAudio(data)
+		if !ok {
+			return
+		}
+		frame := dec.Decode(payload)
+		if _, sink := callPlayerSink(call); sink != nil {
+			_ = sink.WriteFrame(frame)
+		}
+		if n := rtpIn.Add(1); n == 1 || n%50 == 0 {
+			log.Info().Uint64("frames", n).Msg("[WACALLS] inbound audio flowing (peer→sistema)")
+		}
+		if rtpIn.Load() == 1 && call != nil {
+			call.setPhase(CallPhaseActive)
+			if fn := call.onReadyFn(); fn != nil {
+				fn()
+			}
+		}
+	})
+
+	mgr.ConfigureRelays(configs)
+	log.Info().Int("relays", len(configs)).Int("connected", mgr.ConnectedCount()).Msg("[WACALLS] relays configurados (multi-relay)")
+
+	// TX: frame-paced, broadcast pra TODOS os relays (o relay que serve o peer recebe).
+	frameInterval := time.Duration(FrameSamples) * time.Second / SampleRate
+	ticker := time.NewTicker(frameInterval)
+	defer ticker.Stop()
+	silence := make([]float32, FrameSamples)
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+		frame := silence
+		if player, _ := callPlayerSink(call); player != nil {
+			if f := player.nextFrame(); f != nil {
+				frame = f
+			}
+		}
+		payload, eerr := enc.Encode(frame)
+		if eerr != nil {
+			continue
+		}
+		packet, perr := txPipe.ProtectAudio(payload)
+		if perr != nil {
+			continue
+		}
+		mgr.Broadcast(packet)
 	}
 }
 
