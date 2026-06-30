@@ -56,8 +56,14 @@ type engineCall struct {
 	started   bool
 	cancel    context.CancelFunc // tears down this call's media goroutine
 
-	// The callee <accept> is deferred until the caller's <mute_v2> arrives.
+	// The callee <accept> is deferred até BOTH (a) o <mute_v2> do caller chegar E (b) o
+	// atendente pegar de verdade (CommitAccept) — evita aceitar cedo (durante o ringback) e
+	// o relay parar de bridar a mídia do peer (EXPERIMENTO: hipótese do "atendimento automático").
 	acceptPending bool
+	muteSeen      bool
+	pickupDone    bool
+	acceptTo      types.JID
+	acceptCreator types.JID
 }
 
 // newEngine creates the engine for a Client.
@@ -354,6 +360,38 @@ func (e *engine) answer(c *Call) error {
 	return nil
 }
 
+// commitAccept marca que o atendente pegou a chamada (pickup humano). Junto com o mute_v2,
+// destrava o <accept> — a ideia é NÃO aceitar durante o ringback automático.
+func (e *engine) commitAccept(callID string) error {
+	e.mu.Lock()
+	m := e.calls[callID]
+	if m != nil {
+		m.pickupDone = true
+	}
+	e.mu.Unlock()
+	if m == nil {
+		return fmt.Errorf("meowcaller: unknown call %s", callID)
+	}
+	e.maybeSendAccept(callID)
+	return nil
+}
+
+// maybeSendAccept dispara o <accept> só quando BOTH o mute_v2 chegou E o atendente pegou.
+func (e *engine) maybeSendAccept(callID string) {
+	e.mu.Lock()
+	m := e.calls[callID]
+	ready := m != nil && m.acceptPending && m.muteSeen && m.pickupDone
+	to, creator := types.JID{}, types.JID{}
+	if m != nil {
+		to, creator = m.acceptTo, m.acceptCreator
+	}
+	e.mu.Unlock()
+	if ready {
+		e.c.log.Info().Str("call_id", callID).Msg("mute_v2 + pickup do atendente — enviando <accept>")
+		e.sendAccept(callID, to, creator)
+	}
+}
+
 // sendAccept sends the deferred callee <accept> (once), in the WA-Web format (metadata +
 // single rate — the peer keeps the call alive with this; capability+both-rates fails).
 func (e *engine) sendAccept(callID string, to, creator types.JID) {
@@ -590,8 +628,15 @@ func (e *engine) onCallRaw(callNode *waBinary.Node) bool {
 				Msg("mute_v2 ignored; call not awaiting accept")
 			return false
 		}
-		e.c.log.Info().Str("call_id", callID).Msg("first mute_v2 received; sending deferred accept")
-		e.sendAccept(callID, callNode.AttrGetter().JID("from"), mv.JID("call-creator"))
+		e.mu.Lock()
+		if m != nil {
+			m.muteSeen = true
+			m.acceptTo = callNode.AttrGetter().JID("from")
+			m.acceptCreator = mv.JID("call-creator")
+		}
+		e.mu.Unlock()
+		e.c.log.Info().Str("call_id", callID).Msg("mute_v2 recebido; aguardando pickup do atendente pra aceitar")
+		e.maybeSendAccept(callID)
 		return false
 	case "video":
 		// Acknowledge the <video> stanza with type="video" — the mid-call video-upgrade
@@ -675,6 +720,11 @@ func (e *engine) onTerminate(callID, reason string) {
 			fn(reason)
 		}
 	}
+	// Remove a call do mapa — senão entradas mortas (e suas goroutines/assinatura) acumulam e
+	// derrubam as próximas chamadas (1ª funciona, resto trava em 1 pacote).
+	e.mu.Lock()
+	delete(e.calls, callID)
+	e.mu.Unlock()
 }
 
 // stopMedia cancels a call's media goroutine if it's running.

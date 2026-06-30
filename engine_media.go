@@ -167,6 +167,14 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		return err
 	}
 	defer ch.Close()
+	// Fecha o canal do relay assim que o ctx for cancelado (call encerrada) — o loop de RX
+	// fica BLOQUEADO em ch.Recv() e não sairia só com o ctx; sem isso a goroutine + a conexão
+	// do relay VAZAM e a assinatura da call anterior atrapalha as próximas (1ª funciona, resto
+	// trava em 1 pacote). Fechar o ch desbloqueia o Recv → runMedia retorna → cleanup completo.
+	go func() {
+		<-ctx.Done()
+		_ = ch.Close()
+	}()
 
 	// Send a consent ping (0x0801) immediately, together with the allocate and BEFORE any
 	// RTP. The relay won't forward the peer's media until consent (ping → pong) is
@@ -229,6 +237,10 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 			_, _ = rand.Read(btx[:])
 			_, _ = ch.Send(stun.BuildBareSenderSubscriptionRequest(btx, peerVideoSsrc, log))
 		}
+		// (4) RE-MANDA o ALLOCATE com a assinatura do peer junto de cada rajada — WaCalls faz
+		// isso (BuildAllocateForRelay com a SSRC list) em todo resend, não só no keepalive 1Hz.
+		// É o que firma a subscrição no relay (sem isso ele bridava só 1 pacote e parava).
+		_, _ = ch.Send(allocate)
 	}
 	if isInbound && consentUsername != "" {
 		log.Info().Bool("video", isVideoCall).Str("peer_ssrc", fmt.Sprintf("0x%08x", peerSsrc)).Str("peer_video_ssrc", fmt.Sprintf("0x%08x", peerVideoSsrc)).Msg("inbound: sending callee ICE-consent (audio+video subscription)")
@@ -511,7 +523,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		if _, sink := callPlayerSink(call); sink != nil {
 			_ = sink.WriteFrame(frame)
 		}
-		if rtpIn++; rtpIn == 1 || rtpIn%1000 == 0 {
+		if rtpIn++; rtpIn == 1 || rtpIn%50 == 0 {
 			log.Info().Uint64("frames", rtpIn).Msg("inbound audio flowing (peer→sistema)")
 		}
 		if rtpIn == 1 {

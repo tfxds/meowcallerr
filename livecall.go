@@ -52,6 +52,10 @@ func (c *Call) IsVideo() bool {
 // if the call is not in a ringing state.
 func (c *Call) Answer() error { return c.eng.answer(c) }
 
+// CommitAccept sinaliza que o atendente HUMANO pegou a chamada. O <accept> só é enviado
+// quando isto E o <mute_v2> do caller já aconteceram (evita aceitar durante o ringback).
+func (c *Call) CommitAccept() error { return c.eng.commitAccept(c.id) }
+
 // Reject declines an inbound call.
 func (c *Call) Reject() error { return c.eng.reject(c) }
 
