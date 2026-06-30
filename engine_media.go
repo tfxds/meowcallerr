@@ -200,6 +200,29 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		_ = ch.Close()
 	}()
 
+	// Re-assinatura do SSRC REAL do peer (estilo WaCalls actualPeerSet, callmanager_media.go:134):
+	// o SSRC do peer que a gente DERIVA às vezes não bate com o que o relay realmente usa. O relay
+	// manda uns poucos pacotes iniciais (broadcast) no SSRC REAL; quando chega o 1º, pegamos esse
+	// SSRC e RE-ASSINAMOS (allocate + consent). SEM isso o relay manda só o broadcast (1 pacote) e
+	// para — era EXATAMENTE o "1 pacote e morre". curPeerSsrc/curAllocate são lidos sob subMu.
+	var subMu sync.Mutex
+	curPeerSsrc := peerSsrc
+	curAllocate := allocate
+	subEp := getMediaRelayEndpoint(rd)
+	rebuildAllocate := func(ps uint32) []byte {
+		if subEp == nil || len(subEp.addresses) == 0 || int(subEp.tokenID) >= len(rd.relayTokens) {
+			return curAllocate
+		}
+		exor, ok := stun.EncodeXorRelayEndpoint(subEp.addresses[0].ipv4, subEp.addresses[0].port, log)
+		if !ok {
+			return curAllocate
+		}
+		var atx [12]byte
+		_, _ = rand.Read(atx[:])
+		sl := stun.BuildWasmSsrcSubscriptionList([]uint32{ssrc}, []uint32{ps}, 0, 0)
+		return stun.BuildWasmStunAllocateRequest(atx, rd.relayTokens[subEp.tokenID], exor, sl, rd.relayKeyASCII, log)
+	}
+
 	// Send a consent ping (0x0801) immediately, together with the allocate and BEFORE any
 	// RTP. The relay won't forward the peer's media until consent (ping → pong) is
 	// established; RTP sent before the first ping is dropped and the relay never bridges.
@@ -242,18 +265,22 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		if consentUsername == "" {
 			return
 		}
+		subMu.Lock()
+		ps := curPeerSsrc
+		al := curAllocate
+		subMu.Unlock()
 		var btx [12]byte
 		// (1) autenticado com ufrag do auth_token
 		_, _ = rand.Read(btx[:])
-		_, _ = ch.Send(stun.BuildIceConsentBindingRequest(btx, consentUsername, peerSsrc, rd.relayKeyASCII, log))
+		_, _ = ch.Send(stun.BuildIceConsentBindingRequest(btx, consentUsername, ps, rd.relayKeyASCII, log))
 		// (2) autenticado com ufrag do token (quando difere do auth_token)
 		if consentUsernameToken != "" {
 			_, _ = rand.Read(btx[:])
-			_, _ = ch.Send(stun.BuildIceConsentBindingRequest(btx, consentUsernameToken, peerSsrc, rd.relayKeyASCII, log))
+			_, _ = ch.Send(stun.BuildIceConsentBindingRequest(btx, consentUsernameToken, ps, rd.relayKeyASCII, log))
 		}
 		// (3) BARE — sem username/MI/fingerprint (a variante que faltava)
 		_, _ = rand.Read(btx[:])
-		_, _ = ch.Send(stun.BuildBareSenderSubscriptionRequest(btx, peerSsrc, log))
+		_, _ = ch.Send(stun.BuildBareSenderSubscriptionRequest(btx, ps, log))
 		// Vídeo: assina TAMBÉM o SSRC de vídeo do peer (autenticado + bare).
 		if isVideoCall && peerVideoSsrc != 0 {
 			_, _ = rand.Read(btx[:])
@@ -261,10 +288,9 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 			_, _ = rand.Read(btx[:])
 			_, _ = ch.Send(stun.BuildBareSenderSubscriptionRequest(btx, peerVideoSsrc, log))
 		}
-		// (4) RE-MANDA o ALLOCATE com a assinatura do peer junto de cada rajada — WaCalls faz
-		// isso (BuildAllocateForRelay com a SSRC list) em todo resend, não só no keepalive 1Hz.
-		// É o que firma a subscrição no relay (sem isso ele bridava só 1 pacote e parava).
-		_, _ = ch.Send(allocate)
+		// (4) RE-MANDA o ALLOCATE (com o SSRC atual) junto de cada rajada — WaCalls faz isso em
+		// todo resend. É o que firma a subscrição no relay (sem isso ele bridava 1 pacote e parava).
+		_, _ = ch.Send(al)
 	}
 	if isInbound && consentUsername != "" {
 		log.Info().Bool("video", isVideoCall).Str("peer_ssrc", fmt.Sprintf("0x%08x", peerSsrc)).Str("peer_video_ssrc", fmt.Sprintf("0x%08x", peerVideoSsrc)).Msg("inbound: sending callee ICE-consent (audio+video subscription)")
@@ -354,7 +380,10 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 			var tx [12]byte
 			_, _ = rand.Read(tx[:])
 			ping := stun.BuildWhatsappPing(tx, log)
-			if _, err := ch.Send(allocate); err != nil {
+			subMu.Lock()
+			al := curAllocate
+			subMu.Unlock()
+			if _, err := ch.Send(al); err != nil {
 				return
 			}
 			_, _ = ch.Send(ping[:])
@@ -459,6 +488,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 
 	buf := make([]byte, 1500)
 	var rtpIn, rtpSeen, unprotectFail, vidIn uint64
+	var audioResubbed bool // re-assina o SSRC real do peer no 1º pacote de áudio (uma vez)
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -494,6 +524,34 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		}
 		if rtpSeen++; rtpSeen == 1 {
 			log.Info().Int("bytes", n).Msg("first RTP-classified packet from relay, relay is bridging the peer's media")
+		}
+		// Re-assina com o SSRC REAL do peer no 1º pacote de ÁUDIO (WaCalls actualPeerSet,
+		// callmanager_media.go:134): o relay manda o broadcast inicial no SSRC real; pegamos esse
+		// SSRC, atualizamos a assinatura se diferir do derivado, e RE-MANDAMOS allocate+consent —
+		// é o que firma o stream contínuo (sem isso o relay manda só o broadcast e para).
+		if isInbound && !audioResubbed {
+			if ah, aok := rtp.ParseRtpHeader(pkt); aok && ah.PayloadType != rtp.RtpPayloadTypeH264 {
+				audioResubbed = true
+				subMu.Lock()
+				if ah.Ssrc != curPeerSsrc {
+					log.Info().Str("derivado", fmt.Sprintf("0x%08x", curPeerSsrc)).Str("real", fmt.Sprintf("0x%08x", ah.Ssrc)).Msg("re-assinando SSRC REAL do peer (actualPeerSet)")
+					curPeerSsrc = ah.Ssrc
+					curAllocate = rebuildAllocate(ah.Ssrc)
+				}
+				subMu.Unlock()
+				// Re-manda a assinatura na hora + pequeno burst (igual ResendSubscriptions do WaCalls).
+				sendConsent()
+				for _, d := range []time.Duration{50, 150, 500} {
+					delay := d * time.Millisecond
+					go func() {
+						select {
+						case <-time.After(delay):
+							sendConsent()
+						case <-ctx.Done():
+						}
+					}()
+				}
+			}
 		}
 		// Demux: H.264 (PT 97) is the peer's video; route it to the video pipeline and
 		// reassemble Annex-B access units, emitting each on the RTP marker bit. Anything else
