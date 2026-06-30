@@ -55,9 +55,8 @@ func (e *engine) maybeStartMedia(callID string) {
 // the channel and the allocate bytes (re-sent by the keepalive).
 //
 // NOT VALIDATED: live-relay only.
-func (e *engine) connectAndAllocate(ctx context.Context, rd *relayData, ssrcList []byte) (relay.RelayChannel, []byte, error) {
+func (e *engine) connectAndAllocate(ctx context.Context, rd *relayData, ep *relayEndpoint, ssrcList []byte) (relay.RelayChannel, []byte, error) {
 	log := e.c.log
-	ep := getMediaRelayEndpoint(rd)
 	if ep == nil || len(ep.addresses) == 0 {
 		return nil, nil, fmt.Errorf("relay has no usable endpoint")
 	}
@@ -147,6 +146,143 @@ func (e *engine) connectAndAllocate(ctx context.Context, rd *relayData, ssrcList
 	return ch, allocate, nil
 }
 
+// runSecondaryRelayRX sobe um RECEPTOR num relay SECUNDÁRIO (multi-relay, só inbound). Conecta,
+// manda allocate + consent-ping + binding-requests (assina o SSRC do peer) + keepalive-ping, e
+// decodifica a voz do peer pro MESMO sink do Call. Sem TX de mídia — só assina e escuta. A voz
+// do peer entra por UM relay específico (o caller escolhe); cobrindo todos, a gente sempre pega.
+func (e *engine) runSecondaryRelayRX(ctx context.Context, rd *relayData, ep *relayEndpoint, ssrc, peerSsrc uint32, ssrcList []byte, callKey []byte, selfLID, peerLID string, call *Call, callID string) {
+	log := e.c.log
+	ch, allocate, err := e.connectAndAllocate(ctx, rd, ep, ssrcList)
+	if err != nil {
+		log.Debug().Err(err).Str("relay", ep.relayName).Msg("[MULTI-RELAY] secundário não conectou")
+		return
+	}
+	defer ch.Close()
+	go func() { <-ctx.Done(); _ = ch.Close() }()
+
+	var consentUsername string
+	if int(ep.authTokenID) < len(rd.authTokens) && rd.authTokens[ep.authTokenID] != nil {
+		var lb [9]byte
+		_, _ = rand.Read(lb[:])
+		consentUsername = base64.StdEncoding.EncodeToString(rd.authTokens[ep.authTokenID]) + ":" + base64.RawURLEncoding.EncodeToString(lb[:])
+	}
+	sendConsent := func() {
+		var btx [12]byte
+		if consentUsername != "" {
+			_, _ = rand.Read(btx[:])
+			_, _ = ch.Send(stun.BuildIceConsentBindingRequest(btx, consentUsername, peerSsrc, rd.relayKeyASCII, log))
+		}
+		_, _ = rand.Read(btx[:])
+		_, _ = ch.Send(stun.BuildBareSenderSubscriptionRequest(btx, peerSsrc, log))
+		_, _ = ch.Send(allocate)
+	}
+	var ptx [12]byte
+	_, _ = rand.Read(ptx[:])
+	initPing := stun.BuildWhatsappPing(ptx, log)
+	_, _ = ch.Send(initPing[:])
+	sendConsent()
+	for _, d := range []time.Duration{50, 150, 500, 1500, 3000} {
+		delay := d * time.Millisecond
+		go func() {
+			select {
+			case <-time.After(delay):
+				sendConsent()
+			case <-ctx.Done():
+			}
+		}()
+	}
+	go func() {
+		t := time.NewTicker(1100 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+			var tx [12]byte
+			_, _ = rand.Read(tx[:])
+			pg := stun.BuildWhatsappPing(tx, log)
+			if _, err := ch.Send(pg[:]); err != nil {
+				return
+			}
+		}
+	}()
+
+	// Manda SILÊNCIO (RTP) frame-paced: o relay só brida a voz do peer depois de aprender o
+	// NOSSO SSRC pelo nosso 1º RTP (WaCalls manda áudio em TODOS os relays). Só silêncio aqui —
+	// a voz real do atendente vai só pelo relay primário, pra não duplicar.
+	if txPipe2, perr := NewMediaPipeline(callKey, selfLID, peerLID, ssrc, FrameSamples, WithLogger(log)); perr == nil {
+		enc2 := mlow.NewMlowEncoder(mlow.WithLogger(log))
+		go func() {
+			silence := make([]float32, FrameSamples)
+			ticker := time.NewTicker(time.Duration(FrameSamples) * time.Second / SampleRate)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+				}
+				payload, eerr := enc2.Encode(silence)
+				if eerr != nil {
+					continue
+				}
+				packet, perr := txPipe2.ProtectAudio(payload)
+				if perr != nil {
+					continue
+				}
+				if _, serr := ch.Send(packet); serr != nil {
+					return
+				}
+			}
+		}()
+	}
+
+	rxPipe, err := NewMediaPipeline(callKey, selfLID, peerLID, ssrc, FrameSamples, WithLogger(log))
+	if err != nil {
+		return
+	}
+	dec := mlow.NewMlowDecoder(mlow.WithLogger(log))
+	buf := make([]byte, 1500)
+	var got uint64
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		n, err := ch.Recv(buf)
+		if err != nil {
+			return
+		}
+		pkt := buf[:n]
+		if !(relay.ClassifyRelayPacket(pkt) == relay.RelayPacketRtp) {
+			if mt, isStun := stun.StunMessageType(pkt); isStun && mt == stun.MsgBindingRequest {
+				if txid, ok := stun.StunTransactionID(pkt); ok && len(txid) == 12 {
+					var tx [12]byte
+					copy(tx[:], txid)
+					_, _ = ch.Send(stun.EncodeStunRequest(stun.MsgBindingSuccess, tx, nil, rd.relayKeyASCII, true, log))
+				}
+			}
+			continue
+		}
+		if vh, ok := rtp.ParseRtpHeader(pkt); ok && vh.PayloadType == rtp.RtpPayloadTypeH264 {
+			continue // vídeo: ignora no secundário
+		}
+		hdr, payload, ok := rxPipe.UnprotectAudio(pkt)
+		if !ok {
+			continue
+		}
+		_ = hdr
+		frame := dec.Decode(payload)
+		if _, sink := callPlayerSink(call); sink != nil {
+			_ = sink.WriteFrame(frame)
+		}
+		if got++; got == 1 {
+			log.Info().Str("relay", ep.relayName).Str("addr", ep.addresses[0].ipv4).Msg("[MULTI-RELAY] voz do peer chegou por relay SECUNDÁRIO")
+		}
+	}
+}
+
 // runMedia runs the per-frame media loop over the relay DataChannel: the Player's frames
 // (or silence) → MLow → E2E-SRTP protect → DataChannel, and DataChannel → classify →
 // unprotect → MLow decode → the Call's sink. A 1 Hz allocate+ping keepalive holds the
@@ -186,9 +322,24 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	}
 	ssrcList := stun.BuildWasmSsrcSubscriptionList(selfList, peerList, 0, 0)
 
-	ch, allocate, err := e.connectAndAllocate(ctx, rd, ssrcList)
+	primaryEp := getMediaRelayEndpoint(rd)
+	ch, allocate, err := e.connectAndAllocate(ctx, rd, primaryEp, ssrcList)
 	if err != nil {
 		return err
+	}
+	// MULTI-RELAY (INBOUND): provado na captura do WaCalls — o offer traz vários relays e a voz
+	// do peer vem por UM específico (o caller escolhe). Conectar em 1 só (palpite) pega só o
+	// broadcast inicial e morre (intermitente). O WaCalls conecta em TODOS. Aqui, no inbound,
+	// subimos um RX secundário em CADA outro relay não-FNA — allocate+consent+keepalive+silêncio
+	// + decode→mesmo sink. A voz do peer entra por qualquer relay que bridar.
+	if isInbound {
+		for i := range rd.endpoints {
+			sec := &rd.endpoints[i]
+			if sec.isFNA || sec == primaryEp || len(sec.addresses) == 0 {
+				continue
+			}
+			go e.runSecondaryRelayRX(ctx, rd, sec, ssrc, peerSsrc, ssrcList, callKey, selfLID, peerLID, call, callID)
+		}
 	}
 	defer ch.Close()
 	// Fecha o canal do relay assim que o ctx for cancelado (call encerrada) — o loop de RX
