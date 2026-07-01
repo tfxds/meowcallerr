@@ -638,6 +638,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	}
 
 	var rtpIn, rtpSeen, unprotectFail, vidIn uint64
+	var vidPkt, vidUnprotectFail, vidFrame uint64
 	var stunSeen int
 	var audioResubbed bool // re-assina o SSRC real do peer no 1º pacote de áudio (uma vez)
 	for {
@@ -710,8 +711,14 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		// is audio. Ported from WaCalls callmanager_video.handleVideoRelayData.
 		// Source of truth: https://github.com/JotaDev66/WaCalls/blob/2d6a1f666426049a89ef9541414e771acdcf8a16/internal/voip/call/callmanager_video.go#L86-L126
 		if vh, vok := rtp.ParseRtpHeader(pkt); vok && vh.PayloadType == rtp.RtpPayloadTypeH264 {
+			if vidPkt++; vidPkt == 1 || vidPkt%50 == 0 {
+				log.Info().Uint64("video_pkts", vidPkt).Uint32("ssrc", vh.Ssrc).Uint16("seq", vh.SequenceNumber).Bool("marker", vh.Marker).Msg("[VIDEO-RX] PT=97 chegou no demux")
+			}
 			_, vpayload, vunok := rxVideoPipe.UnprotectAudio(pkt)
 			if !vunok {
+				if vidUnprotectFail++; vidUnprotectFail == 1 || vidUnprotectFail%50 == 0 {
+					log.Warn().Uint64("fails", vidUnprotectFail).Uint32("ssrc", vh.Ssrc).Uint16("seq", vh.SequenceNumber).Msg("[VIDEO-RX] unprotect FALHOU (chave/roc do vídeo)")
+				}
 				e.c.diag.Emit("video", map[string]any{"event": "unprotect_failed", "ssrc": vh.Ssrc, "seq": vh.SequenceNumber})
 				continue
 			}
@@ -723,7 +730,11 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 				frame := videoAU
 				videoAU = nil
 				e.c.diag.Emit("video", map[string]any{"event": "frame", "ssrc": vh.Ssrc, "bytes": len(frame)})
-				if sink := callVideoSink(call); sink != nil {
+				sink := callVideoSink(call)
+				if vidFrame++; vidFrame == 1 || vidFrame%30 == 0 {
+					log.Info().Uint64("frames", vidFrame).Bool("sink_attached", sink != nil).Int("au_bytes", len(frame)).Msg("[VIDEO-RX] access unit montado → sink")
+				}
+				if sink != nil {
 					_ = sink.WriteVideo(frame)
 				}
 			}
@@ -850,12 +861,71 @@ func (e *engine) runMediaWacalls(ctx context.Context, callID string, call *Call,
 			Msg("[WACALLS-SUMMARY] recebidos-RTP vs nao-RTP vs decodificados")
 	}()
 
+	// ── Vídeo RX (aditivo — NÃO toca no path de áudio): pipeline E2E-SRTP própria pro PT=97.
+	// O decrypt usa o SSRC do pacote + as recvKeys da call (iguais ao áudio). Depacketiza
+	// H.264 → Annex-B e emite cada access unit no marker bit pro ReceiveVideo (que o
+	// /call/video-ws entrega no browser). Se derivação/pipeline falhar, vídeo RX fica off e
+	// o áudio segue normal. FIX: o loop ativo dropava o PT=97 no IsRtpPacket (áudio-only).
+	var rxVideoPipe *MediaPipeline
+	if vss, verr := rtp.DeriveWasmParticipantSsrc(callID, rtp.FormatE2ESrtpParticipantID(selfLID), rtp.VideoSlotWord, log); verr != nil {
+		log.Warn().Err(verr).Msg("[VIDEO-RX] deriv video ssrc falhou — vídeo RX off")
+	} else if vp, verr := NewMediaPipeline(callKey, selfLID, peerLID, vss, FrameSamples, WithLogger(log)); verr != nil {
+		log.Warn().Err(verr).Msg("[VIDEO-RX] pipeline de vídeo falhou — vídeo RX off")
+	} else {
+		rxVideoPipe = vp
+	}
+	var videoMu sync.Mutex
+	var videoDepack rtp.H264Depacketizer
+	var videoAU []byte
+	var vidPkt, vidFail, vidFrame atomic.Uint64
+
 	mgr.SetOnReceive(func(data []byte) {
 		if wacallsrelay.IsStunPacket(data) {
 			nonRtp.Add(1)
 			return
 		}
-		if !wacallsrelay.IsRtpPacket(data) || len(data) < 12 {
+		if len(data) < 12 {
+			nonRtp.Add(1)
+			return
+		}
+		// VÍDEO (PT=97 H.264): desempacota + monta Annex-B → ReceiveVideo, em vez de dropar.
+		if rxVideoPipe != nil && (data[1]&0x7f) == rtp.RtpPayloadTypeH264 {
+			vh, vok := rtp.ParseRtpHeader(data)
+			if !vok {
+				return
+			}
+			if vp := vidPkt.Add(1); vp == 1 || vp%50 == 0 {
+				log.Info().Uint64("video_pkts", vp).Uint32("ssrc", vh.Ssrc).Bool("marker", vh.Marker).Msg("[VIDEO-RX] PT=97 no onReceive ativo")
+			}
+			_, vpayload, vunok := rxVideoPipe.UnprotectAudio(data)
+			if !vunok {
+				if vf := vidFail.Add(1); vf == 1 || vf%50 == 0 {
+					log.Warn().Uint64("fails", vf).Uint32("ssrc", vh.Ssrc).Msg("[VIDEO-RX] unprotect de vídeo FALHOU")
+				}
+				return
+			}
+			var frame []byte
+			videoMu.Lock()
+			for _, nalu := range videoDepack.Depacketize(vpayload) {
+				videoAU = append(videoAU, 0x00, 0x00, 0x00, 0x01)
+				videoAU = append(videoAU, nalu...)
+			}
+			if vh.Marker && len(videoAU) > 0 {
+				frame = videoAU
+				videoAU = nil
+			}
+			videoMu.Unlock()
+			if frame != nil {
+				if sink := callVideoSink(call); sink != nil {
+					_ = sink.WriteVideo(frame)
+				}
+				if vfr := vidFrame.Add(1); vfr == 1 || vfr%30 == 0 {
+					log.Info().Uint64("frames", vfr).Int("au_bytes", len(frame)).Msg("[VIDEO-RX] access unit → ReceiveVideo")
+				}
+			}
+			return
+		}
+		if !wacallsrelay.IsRtpPacket(data) {
 			nonRtp.Add(1)
 			return
 		}
