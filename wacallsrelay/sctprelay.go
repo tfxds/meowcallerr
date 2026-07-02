@@ -76,6 +76,7 @@ type SctpRelayManager struct {
 
 	audioSsrc        uint32
 	subscriptionSsrc uint32
+	activeConnID     string // relay que entrega o media do peer — alvo do uplink de VÍDEO (evita broadcast pros 3)
 
 	onConnected func(ip string, port int)
 
@@ -198,6 +199,12 @@ func (m *SctpRelayManager) connectToRelay(info RelayConfig) {
 	channel.OnClose(func() { m.closeConnection(id) })
 	channel.OnMessage(func(msg webrtc.DataChannelMessage) {
 		wireLog("[WIRE-RX]", id, msg.Data)
+		// Relay que entrega RTP do peer = o "ativo"; vira alvo do uplink de vídeo (SendActive).
+		if IsRtpPacket(msg.Data) {
+			m.mu.Lock()
+			m.activeConnID = id
+			m.mu.Unlock()
+		}
 		if m.onReceive != nil {
 			m.onReceive(msg.Data)
 		}
@@ -376,6 +383,20 @@ func (m *SctpRelayManager) Broadcast(data []byte) {
 	for _, c := range conns {
 		m.sendRaw(c, data)
 	}
+}
+
+// SendActive manda pra APENAS o relay que está entregando o media do peer (o "ativo"), com
+// fallback pro broadcast se ainda não souber qual é. Usado pelo uplink de VÍDEO pra não
+// triplicar a carga (broadcast pros 3 relays) e afogar o áudio.
+func (m *SctpRelayManager) SendActive(data []byte) {
+	m.mu.Lock()
+	conn := m.connections[m.activeConnID]
+	m.mu.Unlock()
+	if conn == nil {
+		m.Broadcast(data)
+		return
+	}
+	m.sendRaw(conn, data)
 }
 
 func (m *SctpRelayManager) HasConnection() bool {

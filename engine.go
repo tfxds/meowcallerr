@@ -613,8 +613,7 @@ func (e *engine) onCallRaw(callNode *waBinary.Node) bool {
 		// Peer recusou/encerrou uma chamada que NÓS originamos (outbound). O WhatsApp manda
 		// <call><reject/>, mas o whatsmeow só emite CallTerminate pra <terminate> → sem isso a
 		// chamada ficava "tocando" pra sempre. ⚠️ SÓ pra OUTBOUND: numa INBOUND multi-relay/
-		// multi-device chegam <call><reject> normais (rejected_elsewhere) que NÃO são o fim —
-		// tratar aqui matava a chamada recebida na hora (regressão 2026-07-02).
+		// multi-device chegam <call><reject> normais (rejected_elsewhere) que NÃO são o fim.
 		callID := kids[0].AttrGetter().String("call-id")
 		if callID == "" {
 			callID = callNode.AttrGetter().String("call-id")

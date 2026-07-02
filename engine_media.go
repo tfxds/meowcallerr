@@ -868,11 +868,36 @@ func (e *engine) runMediaWacalls(ctx context.Context, callID string, call *Call,
 	// o áudio segue normal. FIX: o loop ativo dropava o PT=97 no IsRtpPacket (áudio-only).
 	var rxVideoPipe *MediaPipeline
 	if vss, verr := rtp.DeriveWasmParticipantSsrc(callID, rtp.FormatE2ESrtpParticipantID(selfLID), rtp.VideoSlotWord, log); verr != nil {
-		log.Warn().Err(verr).Msg("[VIDEO-RX] deriv video ssrc falhou — vídeo RX off")
-	} else if vp, verr := NewMediaPipeline(callKey, selfLID, peerLID, vss, FrameSamples, WithLogger(log)); verr != nil {
-		log.Warn().Err(verr).Msg("[VIDEO-RX] pipeline de vídeo falhou — vídeo RX off")
+		log.Warn().Err(verr).Msg("[VIDEO] deriv video ssrc falhou — vídeo off")
 	} else {
-		rxVideoPipe = vp
+		if vp, e2 := NewMediaPipeline(callKey, selfLID, peerLID, vss, FrameSamples, WithLogger(log)); e2 != nil {
+			log.Warn().Err(e2).Msg("[VIDEO-RX] pipeline de vídeo RX falhou — RX off")
+		} else {
+			rxVideoPipe = vp
+		}
+		// ── Vídeo TX: a câmera do browser chega no /call/video-ws → Call.SendVideo → m.videoTx.send
+		// → empacota PT-97 + E2E-SRTP e manda via mgr.Broadcast (mesmo transporte do áudio).
+		if txp, e3 := NewMediaPipeline(callKey, selfLID, peerLID, vss, FrameSamples, WithLogger(log)); e3 != nil {
+			log.Warn().Err(e3).Msg("[VIDEO-TX] pipeline de vídeo TX falhou — TX off")
+		} else {
+			vsender := &videoSender{pipe: txp, ch: &mgrBroadcastChannel{mgr: mgr}, ssrc: vss}
+			e.mu.Lock()
+			if m := e.calls[callID]; m != nil {
+				m.videoTx = vsender
+			}
+			e.mu.Unlock()
+			defer func() {
+				vsender.mu.Lock()
+				vsender.ch = nil
+				vsender.mu.Unlock()
+				e.mu.Lock()
+				if m := e.calls[callID]; m != nil {
+					m.videoTx = nil
+				}
+				e.mu.Unlock()
+			}()
+			log.Info().Msg("[VIDEO-TX] videoSender registrado (câmera do browser → PT=97 via mgr)")
+		}
 	}
 	var videoMu sync.Mutex
 	var videoDepack rtp.H264Depacketizer
@@ -1010,6 +1035,15 @@ func callVideoSink(call *Call) VideoSink {
 
 // videoRtpStepSamples advances the 90 kHz video RTP timestamp one frame at 15 fps.
 const videoRtpStepSamples = 90000 / 15
+
+// mgrBroadcastChannel adapta o SctpRelayManager (Broadcast pra todos os relays) à interface
+// RelayChannel, pra o videoSender TX mandar os pacotes PT-97 pelo mesmo transporte multi-relay
+// do áudio. Recv nunca é chamado neste canal (é só TX).
+type mgrBroadcastChannel struct{ mgr *wacallsrelay.SctpRelayManager }
+
+func (m *mgrBroadcastChannel) Send(data []byte) (int, error) { m.mgr.SendActive(data); return len(data), nil }
+func (m *mgrBroadcastChannel) Recv(buf []byte) (int, error)  { return 0, nil }
+func (m *mgrBroadcastChannel) Close() error                  { return nil }
 
 // videoSender packetizes encoded H.264 access units (Annex-B) into PT-97 RTP, E2E-SRTP
 // protects them with the video pipeline, and sends them to the relay. The send path is
