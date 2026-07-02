@@ -609,6 +609,17 @@ func (e *engine) onCallRaw(callNode *waBinary.Node) bool {
 		return false
 	}
 	switch kids[0].Tag {
+	case "reject", "terminate":
+		// Peer recusou/encerrou a chamada. Numa OUTBOUND o WhatsApp manda <call><reject/>, mas o
+		// whatsmeow só emite events.CallTerminate pra <terminate> — então a chamada ficava
+		// "tocando" pra sempre (modal do atendente nunca fechava). Dispara o fim aqui.
+		callID := kids[0].AttrGetter().String("call-id")
+		if callID == "" {
+			callID = callNode.AttrGetter().String("call-id")
+		}
+		e.c.log.Info().Str("call_id", callID).Str("tag", kids[0].Tag).Msg("peer encerrou a chamada")
+		e.onTerminate(callID, kids[0].Tag)
+		return false
 	case "mute_v2":
 		mv := kids[0].AttrGetter()
 		callID := mv.String("call-id")
