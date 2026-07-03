@@ -108,7 +108,17 @@ func (e *engine) install() {
 		case *events.CallTransport:
 			e.onRelay(ev.CallID, ev.Data)
 		case *events.CallTerminate:
-			e.onTerminate(ev.CallID, ev.Reason)
+			// COEX/multi-device: numa chamada INBOUND, o WhatsApp manda CallTerminate
+			// reason=rejected_elsewhere quando OUTRO device (coex/primário) RECUSA — mas a
+			// chamada CONTINUA tocando pra NÓS. Encerrar aqui mata o toque antes do atendente
+			// pegar (era por isso que em coex "não recebia"). O Baileys (NexCall) ignora esse
+			// sinal e toca normal. Espelhamos: pra INBOUND ignoramos rejected_elsewhere; qualquer
+			// outro motivo (accepted_elsewhere = outro atendeu, timeout, hangup do caller) encerra.
+			if m := e.lookup(ev.CallID); m != nil && m.direction == CallDirectionIncoming && ev.Reason == "rejected_elsewhere" {
+				e.c.log.Info().Str("call_id", ev.CallID).Msg("inbound rejected_elsewhere ignorado — mantém tocando (estilo Baileys/coex)")
+			} else {
+				e.onTerminate(ev.CallID, ev.Reason)
+			}
 		}
 	})
 }
