@@ -642,8 +642,20 @@ func (e *engine) onCallRaw(callNode *waBinary.Node) bool {
 			callID = callNode.AttrGetter().String("call-id")
 		}
 		if m := e.lookup(callID); m != nil && m.direction == CallDirectionOutgoing {
-			e.c.log.Info().Str("call_id", callID).Str("tag", kids[0].Tag).Msg("peer encerrou a chamada outbound")
-			e.onTerminate(callID, kids[0].Tag)
+			fromJID := callNode.AttrGetter().JID("from")
+			reason := kids[0].AttrGetter().String("reason")
+			// MULTI-DEVICE: um COMPANION do callee (device != 0, ex: WhatsApp Web) manda <reject>
+			// (tipicamente reason=busy) enquanto o aparelho PRINCIPAL ainda toca. Isso NÃO é o fim —
+			// só encerramos em <terminate>, ou <reject> do device 0 (o principal recusou de fato).
+			// Espelha o rejected_elsewhere do inbound. Sem isso, callee com aparelho linkado nunca
+			// completava a chamada (matava em ~0.3s com o celular tocando).
+			if kids[0].Tag == "reject" && fromJID.Device != 0 {
+				e.c.log.Info().Str("call_id", callID).Str("from", fromJID.String()).Str("reason", reason).
+					Msg("outbound reject de COMPANION ignorado — aparelho principal ainda toca")
+			} else {
+				e.c.log.Info().Str("call_id", callID).Str("tag", kids[0].Tag).Str("reason", reason).Msg("peer encerrou a chamada outbound")
+				e.onTerminate(callID, kids[0].Tag)
+			}
 		}
 		return false
 	case "mute_v2":
