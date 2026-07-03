@@ -422,6 +422,19 @@ func (e *engine) sendAccept(callID string, to, creator types.JID) {
 		Video:      isVideo,
 		Metadata:   waBinary.Attrs{"peer_abtest_bucket_id_list": "125208,94276"},
 	})
+	// 🎯 COEX FIX (dica :0@ do Thiago / SheIITear index.mts:392): em coex o offer chega do peer
+	// como LID PELADO (user@lid, sem device). O accept precisa endereçar o peer como device :0
+	// EXPLÍCITO (user:0@lid = primário/dono). O whatsmeow normaliza device 0 → JID pelado (String()
+	// omite o :0), mas o server DISTINGUE user@lid de user:0@lid → recusa o pelado com 500. Setamos
+	// o to e o call-creator como STRING crua com :0 (o encoder manda como string; o server parseia).
+	if to.Server == "lid" && to.Device == 0 {
+		lid0 := to.User + ":0@lid"
+		accept.Attrs["to"] = lid0
+		if children, ok := accept.Content.([]waBinary.Node); ok && len(children) > 0 && children[0].Attrs != nil && creator.Server == "lid" {
+			children[0].Attrs["call-creator"] = creator.User + ":0@lid"
+		}
+		e.c.log.Info().Str("call_id", callID).Str("to0", lid0).Msg("[COEX] accept com device :0 explícito (to + call-creator)")
+	}
 	accept.Attrs["id"] = e.c.wa.DangerousInternals().GenerateRequestID()
 	if err := e.c.wa.DangerousInternals().SendNode(context.Background(), accept); err != nil {
 		e.c.log.Error().Err(err).Str("call_id", callID).Msg("send accept failed")
