@@ -122,6 +122,42 @@ func TestCryptPayloadMatchesKAT(t *testing.T) {
 	}
 }
 
+func TestSrtcpRoundTripsAndAuthenticates(t *testing.T) {
+	callKey := make([]byte, 32)
+	for i := range callKey {
+		callKey[i] = byte(i)
+	}
+	keys, err := DeriveE2eSrtcpKeys(callKey, "111111111111111:0@lid")
+	if err != nil {
+		t.Fatalf("derive srtcp: %v", err)
+	}
+	rtpKeys, err := DeriveE2eKeys(callKey, "111111111111111:0@lid")
+	if err != nil {
+		t.Fatalf("derive srtp: %v", err)
+	}
+	if keys == rtpKeys {
+		t.Fatal("SRTCP keys must use distinct KDF labels")
+	}
+
+	ssrc := uint32(0x12345678)
+	plain := mustHex(t, "80c8000612345678ea11180000000000000006400000000500000258")
+	protected, err := ProtectSrtcp(&keys, ssrc, 1, plain)
+	if err != nil {
+		t.Fatalf("protect srtcp: %v", err)
+	}
+	if len(protected) != len(plain)+SrtcpTrailerLen {
+		t.Fatalf("protected length = %d, want %d", len(protected), len(plain)+SrtcpTrailerLen)
+	}
+	recovered, index, ok := UnprotectSrtcp(&keys, ssrc, protected)
+	if !ok || index != 1 || !bytes.Equal(recovered, plain) {
+		t.Fatalf("unprotect = (%x, %d, %v), want (%x, 1, true)", recovered, index, ok, plain)
+	}
+	protected[len(protected)-1] ^= 1
+	if _, _, ok := UnprotectSrtcp(&keys, ssrc, protected); ok {
+		t.Fatal("forged SRTCP tag accepted")
+	}
+}
+
 // TestRocTrackerWraps exercises both the send-side monotonic tracker and the
 // recv-side guess estimator across wraps, reorder dips, and late packets.
 func TestRocTrackerWraps(t *testing.T) {

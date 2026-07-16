@@ -3,6 +3,8 @@ package srtp
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
+	"crypto/sha1"
 	"errors"
 
 	"github.com/purpshell/meowcaller/util"
@@ -20,6 +22,12 @@ type E2eSrtpKeys struct {
 	Salt      [14]byte
 	AuthKey   [20]byte
 }
+
+const (
+	SrtcpAuthTagLen = 10
+	SrtcpTrailerLen = 4 + SrtcpAuthTagLen
+	rtcpHeaderLen   = 8
+)
 
 // aesCmKdf is the AES-CM PRF (libsrtp KDF): IV = master salt with label XORed into
 // byte 7, zero-padded to 16, then AES-128-CTR keystream over len zero bytes.
@@ -39,27 +47,31 @@ func aesCmKdf(masterKey, masterSalt []byte, label byte, length int) ([]byte, err
 
 // deriveSessionKeysFromMaster splits the 46-byte master into key (16) + salt (14)
 // and runs the AES-CM PRF three times (labels 0x00/0x01/0x02) for cipher/auth/salt.
-func deriveSessionKeysFromMaster(master []byte) (E2eSrtpKeys, error) {
+func deriveSessionKeysFromMasterLabels(master []byte, cipherLabel, authLabel, saltLabel byte) (E2eSrtpKeys, error) {
 	// Source of truth: https://github.com/oxidezap/whatsapp-rust/blob/41095d4e6ba4610e054e9ede3af1d5e88a83faee/wacore/src/voip/e2e_srtp.rs#L34-L49
 	masterKey := master[0:16]
 	masterSalt := master[16:30]
 	var keys E2eSrtpKeys
-	cipherKey, err := aesCmKdf(masterKey, masterSalt, 0x00, 16)
+	cipherKey, err := aesCmKdf(masterKey, masterSalt, cipherLabel, 16)
 	if err != nil {
 		return E2eSrtpKeys{}, err
 	}
 	copy(keys.CipherKey[:], cipherKey)
-	authKey, err := aesCmKdf(masterKey, masterSalt, 0x01, 20)
+	authKey, err := aesCmKdf(masterKey, masterSalt, authLabel, 20)
 	if err != nil {
 		return E2eSrtpKeys{}, err
 	}
 	copy(keys.AuthKey[:], authKey)
-	salt, err := aesCmKdf(masterKey, masterSalt, 0x02, 14)
+	salt, err := aesCmKdf(masterKey, masterSalt, saltLabel, 14)
 	if err != nil {
 		return E2eSrtpKeys{}, err
 	}
 	copy(keys.Salt[:], salt)
 	return keys, nil
+}
+
+func deriveSessionKeysFromMaster(master []byte) (E2eSrtpKeys, error) {
+	return deriveSessionKeysFromMasterLabels(master, 0x00, 0x01, 0x02)
 }
 
 // DeriveE2eKeys derives the E2E 1:1 keys from callKey (>=32B) using participantLid
@@ -78,6 +90,23 @@ func DeriveE2eKeys(callKey []byte, participantLid string, log ...zerolog.Logger)
 		return E2eSrtpKeys{}, err
 	}
 	return deriveSessionKeysFromMaster(master)
+}
+
+// DeriveE2eSrtcpKeys derives the per-participant SRTCP keys using RFC 3711 labels.
+func DeriveE2eSrtcpKeys(callKey []byte, participantLid string, log ...zerolog.Logger) (E2eSrtpKeys, error) {
+	lg := pickLog(log)
+	if len(callKey) < 32 {
+		return E2eSrtpKeys{}, errShortKey
+	}
+	master, err := util.HKDFSHA256(make([]byte, 32), callKey[:32], []byte(participantLid), 46)
+	if err != nil {
+		return E2eSrtpKeys{}, err
+	}
+	keys, err := deriveSessionKeysFromMasterLabels(master, 0x03, 0x04, 0x05)
+	if err != nil {
+		lg.Debug().Err(err).Str("participant_lid", participantLid).Msg("e2e srtcp key derivation failed")
+	}
+	return keys, err
 }
 
 // DeriveE2eKeysFromRaw derives the E2E 1:1 keys from a keygen-v2 <raw_e2e> blob
@@ -135,6 +164,54 @@ func CryptPayload(keys *E2eSrtpKeys, ssrc uint32, seq uint16, roc uint32, payloa
 	cipher.NewCTR(block, iv[:]).XORKeyStream(out, out)
 	lg.Trace().Uint32("ssrc", ssrc).Uint16("seq", seq).Uint32("roc", roc).Int("payload_bytes", len(payload)).Msg("e2e crypt payload")
 	return out, nil
+}
+
+// ProtectSrtcp encrypts and authenticates one RTCP packet.
+func ProtectSrtcp(keys *E2eSrtpKeys, senderSsrc, index uint32, rtcp []byte) ([]byte, error) {
+	split := len(rtcp)
+	if split > rtcpHeaderLen {
+		split = rtcpHeaderLen
+	}
+	out := append([]byte(nil), rtcp[:split]...)
+	body, err := CryptPayload(keys, senderSsrc, uint16(index), index>>16, rtcp[split:])
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, body...)
+	var indexWord [4]byte
+	indexWord[0] = byte((0x80000000 | index) >> 24)
+	indexWord[1] = byte((0x80000000 | index) >> 16)
+	indexWord[2] = byte((0x80000000 | index) >> 8)
+	indexWord[3] = byte(0x80000000 | index)
+	out = append(out, indexWord[:]...)
+	mac := hmac.New(sha1.New, keys.AuthKey[:])
+	_, _ = mac.Write(out)
+	out = append(out, mac.Sum(nil)[:SrtcpAuthTagLen]...)
+	return out, nil
+}
+
+// UnprotectSrtcp authenticates and decrypts one SRTCP packet.
+func UnprotectSrtcp(keys *E2eSrtpKeys, senderSsrc uint32, packet []byte) ([]byte, uint32, bool) {
+	if len(packet) < rtcpHeaderLen+SrtcpTrailerLen {
+		return nil, 0, false
+	}
+	tagStart := len(packet) - SrtcpAuthTagLen
+	mac := hmac.New(sha1.New, keys.AuthKey[:])
+	_, _ = mac.Write(packet[:tagStart])
+	if !hmac.Equal(packet[tagStart:], mac.Sum(nil)[:SrtcpAuthTagLen]) {
+		return nil, 0, false
+	}
+	indexStart := tagStart - 4
+	index := uint32(packet[indexStart])<<24 | uint32(packet[indexStart+1])<<16 |
+		uint32(packet[indexStart+2])<<8 | uint32(packet[indexStart+3])
+	index &= 0x7fffffff
+	body, err := CryptPayload(keys, senderSsrc, uint16(index), index>>16, packet[rtcpHeaderLen:indexStart])
+	if err != nil {
+		return nil, 0, false
+	}
+	out := append([]byte(nil), packet[:rtcpHeaderLen]...)
+	out = append(out, body...)
+	return out, index, true
 }
 
 // RocTracker is the send-side ROC tracker for monotonic 16-bit sequence numbers.
