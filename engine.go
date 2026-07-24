@@ -299,6 +299,9 @@ func (e *engine) onOffer(ev *events.CallOffer) {
 	m.isVideo = isVideo
 	if r := findRelay(ev.Data); r != nil {
 		m.relay = parseRelayData(r)
+		if !m.relay.peerJID.IsEmpty() {
+			m.peerLID = m.relay.peerJID.String()
+		}
 	}
 	e.applyVoipSettingsCodec(m, ev.Data, ev.CallID)
 	e.mu.Unlock()
@@ -502,14 +505,38 @@ func (e *engine) onRelay(callID string, data *waBinary.Node) {
 	if r == nil {
 		return
 	}
+	rd := parseRelayData(r)
+	var peerLID string
+	var jaComecou bool
 	e.mu.Lock()
 	m := e.calls[callID]
 	if m == nil {
 		e.mu.Unlock()
 		return
 	}
-	m.relay = parseRelayData(r)
+	m.relay = rd
+	// O <relay> anuncia o peer COM O DEVICE, e ele pode ser diferente do device que veio no
+	// offer. O SSRC do peer é derivado desse JID: device errado = assinamos o stream errado no
+	// relay = a mídia do cliente nunca é entregue ("1 pacote e silêncio"). Upstream #17.
+	if !rd.peerJID.IsEmpty() {
+		peerLID = rd.peerJID.String()
+		if peerLID != m.peerLID {
+			m.peerLID = peerLID
+			jaComecou = m.started
+		}
+	}
 	e.mu.Unlock()
+	if peerLID != "" && jaComecou {
+		// ⚠️ NÃO portamos o rekey no meio da chamada (upstream faz via m.rekeyPeer, que exige
+		// o pipeline de mídia saber re-derivar chave/SSRC ao vivo — nosso runMedia não sabe).
+		// Se o relay trocar o peer DEPOIS da mídia subir, esta chamada segue no peer antigo.
+		// O caso comum (device errado desde o começo) está coberto: aqui a mídia ainda não subiu.
+		e.c.log.Warn().Str("call_id", callID).Str("peer_lid", peerLID).
+			Msg("relay elegeu outro peer com a mídia já rodando — sem rekey ao vivo (ver upstream #17)")
+	} else if peerLID != "" {
+		e.c.log.Info().Str("call_id", callID).Str("peer_lid", peerLID).
+			Msg("peer do relay adotado antes da mídia subir")
+	}
 	e.maybeStartMedia(callID)
 }
 
@@ -963,6 +990,7 @@ type relayData struct {
 	relayTokens   [][]byte // indexed <token id=…>
 	authTokens    [][]byte // indexed <auth_token id=…> — base of the synthetic ICE ufrag
 	endpoints     []relayEndpoint
+	peerJID       types.JID
 }
 
 func nodeBytes(n *waBinary.Node) []byte {
@@ -1075,21 +1103,26 @@ func parseRelayData(node *waBinary.Node) *relayData {
 	rd.authTokens = parseIndexedTokens(node, "auth_token")
 
 	kids := node.GetChildren()
+	peerPID := node.AttrGetter().String("peer_pid")
 	for i := range kids {
-		te2 := &kids[i]
-		if te2.Tag != "te2" {
+		child := &kids[i]
+		if child.Tag == "participant" && peerPID != "" && child.AttrGetter().String("pid") == peerPID {
+			rd.peerJID = child.AttrGetter().JID("jid")
 			continue
 		}
-		ab := nodeBytes(te2)
+		if child.Tag != "te2" {
+			continue
+		}
+		ab := nodeBytes(child)
 		if len(ab) != 6 { // IPv4:port only (IPv6 endpoints skipped)
 			continue
 		}
 		ep := relayEndpoint{
-			relayID:     attrUint(te2, "relay_id"),
-			relayName:   te2.AttrGetter().String("relay_name"),
-			tokenID:     attrUint(te2, "token_id"),
-			authTokenID: attrUint(te2, "auth_token_id"),
-			isFNA:       te2.AttrGetter().String("is_fna") == "1",
+			relayID:     attrUint(child, "relay_id"),
+			relayName:   child.AttrGetter().String("relay_name"),
+			tokenID:     attrUint(child, "token_id"),
+			authTokenID: attrUint(child, "auth_token_id"),
+			isFNA:       child.AttrGetter().String("is_fna") == "1",
 			addresses: []relayAddress{{
 				ipv4: fmt.Sprintf("%d.%d.%d.%d", ab[0], ab[1], ab[2], ab[3]),
 				port: binary.BigEndian.Uint16(ab[4:6]),
