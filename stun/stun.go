@@ -487,3 +487,39 @@ func BuildAndroidStunAllocateRequest(transactionID [12]byte, relayToken []byte, 
 	attrs = append(attrs, stunAttr(attrStreamDescriptors, CreateApkStreamDescriptors(ssrc))...)
 	return EncodeStunRequest(MsgAllocateRequest, transactionID, attrs, integrityKey, includeFingerprint, lg)
 }
+
+// BuildWasmSsrcGrid monta a lista de inscrição (attr 0x4024) no formato que o motor
+// whatsapp.wasm de verdade usa — capturado do fio em 2026-09-10 e conferido byte a byte.
+//
+// ⭐ O QUE MUDA EM RELAÇÃO AO QUE SE FAZIA:
+//   - São NOVE entradas, uma por stream de relay, na ordem de WasmRelayStreamSlotWords
+//     ({0,1,4,2,3,5,7,8,6}) — não duas.
+//   - TODAS derivam do NOSSO PRÓPRIO LID. **Não vai nenhum SSRC do peer.** A lista diz
+//     "estes são os meus streams", não "me manda o stream do peer". Foi por isso que caçar
+//     o SSRC do chamador nunca levou a lugar nenhum: ele não pertence a esta mensagem.
+//   - Os campos 1 e 2 são o índice na grade 3×3 (i/3, i%3) e são OMITIDOS quando zero,
+//     como manda o proto3 — a entrada 0 do motor não traz nenhum dos dois.
+//
+// Conferido: as 6 primeiras entradas capturadas do motor batem exatamente com
+// DeriveWasmParticipantSsrc(callID, nossoLID, slot) nos slots 0,1,4,2,3,5.
+func BuildWasmSsrcGrid(ssrcs [9]uint32) []byte {
+	var out []byte
+	for i, ssrc := range ssrcs {
+		if ssrc == 0 {
+			continue
+		}
+		var inner []byte
+		if p := uint64(i / 3); p != 0 {
+			inner = pbTag(inner, 1, 0)
+			inner = binary.AppendUvarint(inner, p)
+		}
+		if s := uint64(i % 3); s != 0 {
+			inner = pbTag(inner, 2, 0)
+			inner = binary.AppendUvarint(inner, s)
+		}
+		inner = pbTag(inner, 3, 0)
+		inner = binary.AppendUvarint(inner, uint64(ssrc))
+		out = pbLenDelim(out, 1, inner)
+	}
+	return out
+}

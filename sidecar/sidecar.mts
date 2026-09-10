@@ -16,6 +16,7 @@
  */
 import http from "node:http";
 import dgram from "node:dgram";
+import { appendFileSync } from "node:fs";
 import { createHmac } from "node:crypto";
 import { WasmEngine } from "/opt/wa-sidecar/lib/sheitear/src/wasm-engine.mjs";
 import { RelayRtcTransport } from "/opt/wa-sidecar/lib/sheitear/src/relay-transport.mjs";
@@ -142,6 +143,25 @@ const peerParaOMotor = (jid: string) =>
  * Loga UMA vez por SSRC distinto, pra não poluir.
  */
 const ssrcVistos = new Set<string>();
+
+/**
+ * GABARITO: grava os pacotes de CONTROLE (STUN) que o motor real troca com o relay —
+ * allocate, binding requests com a lista de inscrição, respostas. É contra isso que a
+ * gente compara o que o meowcaller monta. Mídia (RTP) fica de fora: é volume e não
+ * interessa aqui. Ligar com DUMP_STUN=1.
+ */
+const DUMP_STUN = process.env.DUMP_STUN === "1";
+const dumpArq = process.env.DUMP_STUN_PATH || "/tmp/gabarito-stun.log";
+let dumpN = 0;
+function anotaStun(data: Uint8Array, lado: "ENVIA" | "RECEBE", ip?: string, porta?: number) {
+  if (!DUMP_STUN || !data || data.length < 20) return;
+  if ((data[0] & 0xc0) !== 0x00) return; // STUN começa com os 2 bits zerados
+  if (dumpN++ > 400) return;             // teto: uma chamada não passa disso
+  const tipo = ((data[0] << 8) | data[1]).toString(16).padStart(4, "0");
+  const linha = `${new Date().toISOString().slice(11, 23)} ${lado} tipo=0x${tipo} len=${data.length} ` +
+    `${ip || ""}:${porta || ""} call=${atual?.callId || "?"}\n  ${Buffer.from(data).toString("hex")}\n`;
+  try { appendFileSync(dumpArq, linha); } catch {}
+}
 function anotaSsrc(data: Uint8Array, lado: "NOSSO" | "PEER") {
   if (!data || data.length < 12) return;
   if ((data[0] & 0xc0) !== 0x80) return; // não é RTP (STUN/consent começa com 0x00/0x01)
@@ -159,6 +179,7 @@ async function subirMotor() {
   relay = new RelayRtcTransport({
     onTransportMessage: (data: Uint8Array, ip: string, port: number) => {
       anotaSsrc(data, "PEER");
+      anotaStun(data, "RECEBE", ip, port);
       engine?.handleOnTransportMessage(data, ip, port);
     },
     onIceRtt: (rtt: number, ip: string, port: number) => engine?.updateIceRtt(rtt, ip, port),
@@ -175,6 +196,7 @@ async function subirMotor() {
       },
       sendDataToRelay: (data: Uint8Array, ip: string, port: number) => {
         anotaSsrc(data, "NOSSO");
+        anotaStun(data, "ENVIA", ip, port);
         relay?.send(data, ip, port);
       },
       onCallEvent: (tipo: number, dados?: string) => aoEventoDoMotor(tipo, dados),

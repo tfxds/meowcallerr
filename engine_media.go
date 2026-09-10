@@ -895,6 +895,16 @@ func (e *engine) runMediaWacalls(ctx context.Context, callID string, call *Call,
 	mgr := wacallsrelay.NewSctpRelayManager(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
 	mgr.SetSsrc(ssrc)
 	mgr.SetSubscriptionSsrc(peerSsrc)
+	// ⭐ Lista de inscrição no formato do motor REAL (capturada do fio em 10/09): 9 entradas,
+	// TODAS derivadas do NOSSO LID, na ordem de WasmRelayStreamSlotWords — e NENHUMA do peer.
+	// A lista diz "estes são os meus streams", não "me manda o stream do peer". As 6 primeiras
+	// entradas do construtor batem BYTE A BYTE com as do motor. Ligar com WHATSMEOW_SUB_GRID=1.
+	if os.Getenv("WHATSMEOW_SUB_GRID") == "1" {
+		if grade, errG := rtp.DeriveWasmRelayStreamSsrcs(callID, rtp.FormatE2ESrtpParticipantID(selfLID), log); errG == nil {
+			mgr.SetSubscriptionList(stun.BuildWasmSsrcGrid(grade))
+			log.Info().Str("self_lid", selfLID).Msg("[EXPERIMENTO] inscrição com a GRADE de 9 streams (formato do motor real)")
+		}
+	}
 	if sPid, pPid := pidsDaInscricao(rd); sPid != 0 || pPid != 0 {
 		mgr.SetPids(sPid, pPid)
 		log.Info().Uint32("self_pid", sPid).Uint32("peer_pid", pPid).

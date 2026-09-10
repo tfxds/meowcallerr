@@ -17,6 +17,36 @@ import (
 // the first 64 bytes when the packet is larger than 200 bytes so audio payload
 // does not flood the capture (the STUN/RTP header is what matters). This is
 // purely diagnostic instrumentation for the relay wire-protocol capture.
+// dumpStun grava os pacotes de CONTROLE (STUN) trocados com o relay num arquivo, no MESMO
+// formato do sidecar (sidecar.mts, anotaStun). É pra comparar byte a byte o que o meowcaller
+// monta contra o que o motor whatsapp.wasm — que funciona — manda: allocate, binding
+// requests com a lista de inscrição, respostas. Ligar com DUMP_STUN=1.
+var dumpStunN int
+
+func dumpStun(lado, id string, data []byte) {
+	if os.Getenv("DUMP_STUN") != "1" || len(data) < 20 {
+		return
+	}
+	if data[0]&0xc0 != 0x00 { // STUN começa com os 2 bits zerados; RTP não
+		return
+	}
+	if dumpStunN++; dumpStunN > 400 {
+		return
+	}
+	caminho := os.Getenv("DUMP_STUN_PATH")
+	if caminho == "" {
+		caminho = "/tmp/meowcaller-stun.log"
+	}
+	f, err := os.OpenFile(caminho, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	tipo := uint16(data[0])<<8 | uint16(data[1])
+	fmt.Fprintf(f, "%s %s tipo=0x%04x len=%d %s\n  %s\n",
+		time.Now().Format("15:04:05.000"), lado, tipo, len(data), id, hex.EncodeToString(data))
+}
+
 func wireLog(dir, id string, data []byte) {
 	ts := time.Now().Format("15:04:05.000")
 	n := len(data)
@@ -78,7 +108,11 @@ type SctpRelayManager struct {
 	subscriptionSsrc uint32
 	selfPid          uint32 // participant-id nosso, vindo de <relay self_pid> (0 = comportamento antigo)
 	peerPid          uint32 // participant-id do chamador, vindo de <relay peer_pid>
-	activeConnID     string // relay que entrega o media do peer — alvo do uplink de VÍDEO (evita broadcast pros 3)
+	// listaPronta: lista de inscrição (attr 0x4024) montada FORA, no formato do motor real
+	// (9 entradas, todas do nosso LID). Quando presente, substitui a montagem antiga de 2
+	// entradas. Ver stun.BuildWasmSsrcGrid.
+	listaPronta  []byte
+	activeConnID string // relay que entrega o media do peer — alvo do uplink de VÍDEO (evita broadcast pros 3)
 
 	onConnected func(ip string, port int)
 
@@ -104,6 +138,9 @@ func (m *SctpRelayManager) SetSubscriptionSsrc(ssrc uint32) { m.subscriptionSsrc
 // SetPids informa os participant-ids que a oferta declarou (<relay self_pid peer_pid>).
 // Sem isso a inscrição vai com 0,0 — pedindo o stream de um participante que não existe.
 func (m *SctpRelayManager) SetPids(selfPid, peerPid uint32) { m.selfPid, m.peerPid = selfPid, peerPid }
+
+// SetSubscriptionList instala a lista de inscrição já montada (formato do motor real).
+func (m *SctpRelayManager) SetSubscriptionList(b []byte) { m.listaPronta = b }
 
 func (m *SctpRelayManager) SetOnConnected(fn func(ip string, port int)) { m.onConnected = fn }
 
@@ -207,6 +244,7 @@ func (m *SctpRelayManager) connectToRelay(info RelayConfig) {
 	channel.OnClose(func() { m.closeConnection(id) })
 	channel.OnMessage(func(msg webrtc.DataChannelMessage) {
 		wireLog("[WIRE-RX]", id, msg.Data)
+		dumpStun("RECEBE", id, msg.Data)
 		// Relay que entrega RTP do peer = o "ativo"; vira alvo do uplink de vídeo (SendActive).
 		if IsRtpPacket(msg.Data) {
 			m.mu.Lock()
@@ -337,6 +375,9 @@ func (m *SctpRelayManager) sendStunRegistration(conn *relayConnection) {
 				peerSsrcs = []uint32{m.subscriptionSsrc}
 			}
 			ssrcList := BuildSSRCSubscriptionList([]uint32{m.audioSsrc}, peerSsrcs, int(m.selfPid), int(m.peerPid))
+			if len(m.listaPronta) > 0 {
+				ssrcList = m.listaPronta
+			}
 			m.sendRaw(conn, BuildAllocateForRelay(info.RawToken, ssrcList, hmacKey, info.IP, info.Port))
 		}
 	}
@@ -384,6 +425,7 @@ func (m *SctpRelayManager) sendRaw(conn *relayConnection, data []byte) {
 		return
 	}
 	wireLog("[WIRE-TX]", conn.id, data)
+	dumpStun("ENVIA", conn.id, data)
 	if err := conn.channel.Send(data); err != nil {
 		m.log.Debug("relay send error", "id", conn.id, "err", err)
 	}
