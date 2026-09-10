@@ -98,3 +98,100 @@ func BuildSenderReport(localSsrc uint32, stats *RtcpSenderStats, nowMs uint64) [
 	binary.BigEndian.PutUint32(buf[24:28], stats.OctetsSent)
 	return buf
 }
+
+// ─── Compound SR+SDES 1:1 (portado do upstream purpshell/meowcaller) ──────────
+// O datasheet do upstream chama este de "the existing byte-verified one-report
+// Sender Report plus SDES packet" — é o formato que o motor real manda numa chamada
+// 1:1. O SR de 28 bytes sozinho (BuildSenderReport) é só a primeira parte dele.
+
+// WhatsappRtcpCnameLen é o tamanho do CNAME randômico que a WhatsApp usa no SDES.
+const WhatsappRtcpCnameLen = 18
+
+// RtcpPtSdes é o payload type do Source Description (RFC 3550).
+const RtcpPtSdes uint8 = 202
+
+// RtcpReceptionReport é o bloco de recepção RFC 3550 que vai dentro do Sender Report.
+// A WhatsApp acrescenta 24 bytes de estatística de transporte depois dele.
+type RtcpReceptionReport struct {
+	Ssrc                       uint32
+	FractionLost               uint8
+	CumulativeLost             int32
+	ExtendedHighestSequence    uint32
+	Jitter                     uint32
+	LastSenderReport           uint32
+	DelaySinceLastSenderReport uint32
+}
+
+// BuildWhatsappRtcpCname monta o CNAME de 18 bytes no formato nativo (`xxxxx@pjxxxxxx.org`).
+func BuildWhatsappRtcpCname(entropy [12]byte) [WhatsappRtcpCnameLen]byte {
+	const hexChars = "0123456789abcdef"
+	var randomHex [11]byte
+	for nibble := range randomHex {
+		b := entropy[6+nibble/2]
+		if nibble&1 == 0 {
+			randomHex[nibble] = hexChars[b>>4]
+		} else {
+			randomHex[nibble] = hexChars[b&0x0f]
+		}
+	}
+	var cname [WhatsappRtcpCnameLen]byte
+	copy(cname[:5], randomHex[:5])
+	copy(cname[5:8], "@pj")
+	copy(cname[8:14], randomHex[5:])
+	copy(cname[14:], ".org")
+	return cname
+}
+
+// BuildSourceDescription monta o SDES de uma chunk, do jeito da WhatsApp.
+func BuildSourceDescription(localSsrc uint32, cname *[WhatsappRtcpCnameLen]byte, profileExtension bool) [32]byte {
+	var packet [32]byte
+	packet[0] = 0x81
+	if profileExtension {
+		packet[0] |= 0x10
+	}
+	packet[1] = RtcpPtSdes
+	binary.BigEndian.PutUint16(packet[2:4], 7)
+	binary.BigEndian.PutUint32(packet[4:8], localSsrc)
+	packet[8] = 1
+	packet[9] = WhatsappRtcpCnameLen
+	copy(packet[10:28], cname[:])
+	return packet
+}
+
+func appendReceptionReport(out []byte, report *RtcpReceptionReport) []byte {
+	out = binary.BigEndian.AppendUint32(out, report.Ssrc)
+	out = append(out, report.FractionLost)
+	lost := uint32(report.CumulativeLost)
+	out = append(out, byte(lost>>16), byte(lost>>8), byte(lost))
+	out = binary.BigEndian.AppendUint32(out, report.ExtendedHighestSequence)
+	out = binary.BigEndian.AppendUint32(out, report.Jitter)
+	out = binary.BigEndian.AppendUint32(out, report.LastSenderReport)
+	out = binary.BigEndian.AppendUint32(out, report.DelaySinceLastSenderReport)
+	return out
+}
+
+// BuildSenderReportWithSdes monta o compound SR+SDES periódico da WhatsApp.
+func BuildSenderReportWithSdes(localSsrc uint32, stats *RtcpSenderStats, nowMs uint64, cname *[WhatsappRtcpCnameLen]byte, profileExtension bool) []byte {
+	return BuildSenderReportWithSdesAndReception(localSsrc, stats, nowMs, cname, nil, profileExtension)
+}
+
+// BuildSenderReportWithSdesAndReception monta o compound 1:1 nativo. O bloco de recepção é
+// o layout RFC 3550 seguido de 24 campos zerados de transporte/BWE — que é como o nativo
+// representa "valor indisponível".
+func BuildSenderReportWithSdesAndReception(localSsrc uint32, stats *RtcpSenderStats, nowMs uint64, cname *[WhatsappRtcpCnameLen]byte, report *RtcpReceptionReport, profileExtension bool) []byte {
+	sr := BuildSenderReport(localSsrc, stats, nowMs)
+	if profileExtension {
+		sr[0] |= 0x10
+	}
+	sdes := BuildSourceDescription(localSsrc, cname, profileExtension)
+	out := make([]byte, 0, len(sr)+48+len(sdes))
+	out = append(out, sr[:]...)
+	if report != nil {
+		out[0] |= 1
+		out = appendReceptionReport(out, report)
+		out = append(out, make([]byte, 24)...)
+		binary.BigEndian.PutUint16(out[2:4], uint16(len(out)/4-1))
+	}
+	out = append(out, sdes[:]...)
+	return out
+}

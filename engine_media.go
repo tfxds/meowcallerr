@@ -1055,14 +1055,18 @@ func (e *engine) runMediaWacalls(ctx context.Context, callID string, call *Call,
 	// Cadeia portada do upstream (c27a5f8, fbeb716, 6e530f7). WHATSMEOW_RTCP=1 liga.
 	rtcpLigado := os.Getenv("WHATSMEOW_RTCP") == "1"
 	var chavesRtcp srtp.E2eSrtpKeys
-	var rtcpIndex uint32
+	var cnameRtcp [rtp.WhatsappRtcpCnameLen]byte
+	rtcpIndex := uint32(1) // o nativo começa em 1, não em 0
 	if rtcpLigado {
 		if k, kerr := srtp.DeriveE2eSrtcpKeys(callKey, rtp.FormatE2ESrtpParticipantID(selfLID), log); kerr != nil {
 			log.Warn().Err(kerr).Msg("[RTCP] não consegui derivar as chaves SRTCP — segue sem RTCP")
 			rtcpLigado = false
 		} else {
 			chavesRtcp = k
-			log.Info().Uint32("ssrc", ssrc).Msg("[RTCP] enviando Sender Report periódico (experimento)")
+			var entropia [12]byte
+			_, _ = rand.Read(entropia[:])
+			cnameRtcp = rtp.BuildWhatsappRtcpCname(entropia)
+			log.Info().Uint32("ssrc", ssrc).Msg("[RTCP] enviando compound SR+SDES periódico")
 		}
 	}
 
@@ -1100,9 +1104,11 @@ func (e *engine) runMediaWacalls(ctx context.Context, callID string, call *Call,
 			if framesDesdeRtcp++; framesDesdeRtcp >= framesPorRtcp {
 				framesDesdeRtcp = 0
 				stats := txPipe.SenderStats()
-				sr := rtp.BuildSenderReport(ssrc, &stats, uint64(time.Now().UnixMilli()))
-				rtcpIndex++
-				if protegido, rerr := srtp.ProtectSrtcp(&chavesRtcp, ssrc, rtcpIndex, sr[:]); rerr == nil {
+				// SR+SDES: é o formato 1:1 que o datasheet do upstream chama de
+				// "byte-verified". O SR de 28 bytes sozinho é só a primeira metade dele.
+				sr := rtp.BuildSenderReportWithSdes(ssrc, &stats, uint64(time.Now().UnixMilli()), &cnameRtcp, false)
+				if protegido, rerr := srtp.ProtectSrtcp(&chavesRtcp, ssrc, rtcpIndex, sr); rerr == nil {
+					rtcpIndex++
 					mgr.Broadcast(protegido)
 				} else {
 					log.Debug().Err(rerr).Msg("[RTCP] protect falhou")
