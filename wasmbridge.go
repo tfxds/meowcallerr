@@ -459,3 +459,16 @@ func (e *engine) encerraPelaPonte(c *Call, motivo string) error {
 	}
 	return nil
 }
+
+// ehDaPonte diz se a chamada é conduzida pelo motor whatsapp.wasm. Usado pra manter o
+// meowcaller FORA dessas chamadas: com os dois agindo no mesmo relay, a inscrição do motor
+// não completa e o áudio do cliente não chega.
+func (e *engine) ehDaPonte(callID string) bool {
+	if !pontewasmLigada() || callID == "" {
+		return false
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	m := e.calls[callID]
+	return m != nil && m.call != nil && m.call.viaPonte
+}

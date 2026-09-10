@@ -316,6 +316,18 @@ func (e *engine) onOffer(ev *events.CallOffer) {
 		mp.direction = CallDirectionIncoming
 		e.mu.Unlock()
 		e.pw().oferta(ev, callKey)
+		// ⭐ O cano de áudio abre JÁ AQUI, durante o toque — não no atendimento. Se a gente
+		// ficar em silêncio esperando o atendente pegar, o relay derrubia a ponte e a voz do
+		// cliente nunca vem (medido: accept em ~1s funciona, em 13s dá 21 frames e para).
+		// É a mesma razão pela qual o caminho do meowcaller toca ringback desde o primeiro
+		// instante. Quem alimenta o cano é o Player que o gateway pluga logo abaixo.
+		if cano, err := e.pw().abrirCanoAudio(chamada); err != nil {
+			e.pw().log.Error().Err(err).Str("call_id", ev.CallID).Msg("não consegui abrir o cano de áudio")
+		} else {
+			e.mu.Lock()
+			chamada.cano = cano
+			e.mu.Unlock()
+		}
 		// Daqui pra frente é idêntico ao caminho de sempre: o gateway toca no navegador,
 		// o atendente pega, e Answer/CommitAccept/Hangup caem nos ramos da ponte.
 		if fn := e.c.incomingCallHandler(); fn != nil {
@@ -458,13 +470,8 @@ func (e *engine) commitAccept(callID string) error {
 	// quando o atendente pega de verdade. E é aqui que o áudio começa a andar.
 	if m.call != nil && m.call.viaPonte {
 		p := e.pw()
-		if cano, err := p.abrirCanoAudio(m.call); err != nil {
-			p.log.Error().Err(err).Str("call_id", callID).Msg("não consegui abrir o cano de áudio")
-		} else {
-			e.mu.Lock()
-			m.call.cano = cano
-			e.mu.Unlock()
-		}
+		// O cano já está aberto desde a oferta (mantendo o relay vivo durante o toque);
+		// aqui é só o pickup de verdade.
 		if _, err := p.postar("/accept", map[string]any{"callId": callID}); err != nil {
 			return fmt.Errorf("accept no motor: %w", err)
 		}
@@ -480,6 +487,13 @@ func (e *engine) commitAccept(callID string) error {
 
 // maybeSendAccept dispara o <accept> só quando BOTH o mute_v2 chegou E o atendente pegou.
 func (e *engine) maybeSendAccept(callID string) {
+	// ⛔ Chamada da PONTE: quem cuida da mídia e da sinalização é o motor whatsapp.wasm.
+	// Se o meowcaller também agir aqui, os dois disputam o mesmo relay (ele assina com o
+	// SSRC dele, responde relaylatency em duplicidade e sobe a mídia dele) — a inscrição do
+	// motor não completa e o áudio do cliente não vem. Medido em 10/09.
+	if e.ehDaPonte(callID) {
+		return
+	}
 	e.mu.Lock()
 	m := e.calls[callID]
 	ready := m != nil && m.acceptPending && m.muteSeen && m.pickupDone
@@ -595,6 +609,13 @@ func (e *engine) hangup(c *Call) error {
 // onRelay records relay data from a relaylatency/transport/ack stanza and starts media
 // once both the callKey and the relay endpoint are known.
 func (e *engine) onRelay(callID string, data *waBinary.Node) {
+	// ⛔ Chamada da PONTE: quem cuida da mídia e da sinalização é o motor whatsapp.wasm.
+	// Se o meowcaller também agir aqui, os dois disputam o mesmo relay (ele assina com o
+	// SSRC dele, responde relaylatency em duplicidade e sobe a mídia dele) — a inscrição do
+	// motor não completa e o áudio do cliente não vem. Medido em 10/09.
+	if e.ehDaPonte(callID) {
+		return
+	}
 	r := findRelay(data)
 	if r == nil {
 		return
@@ -638,6 +659,11 @@ func (e *engine) onRelay(callID string, data *waBinary.Node) {
 // onRelayLatency answers the caller's relaylatency probes (the callee's half of the
 // relay election). It does NOT send the accept — that is deferred until <mute_v2>.
 func (e *engine) onRelayLatency(ev *events.CallRelayLatency) {
+	// Ponte: quem responde o relaylatency é o motor (a resposta dele já sai pelo /out).
+	// Responder aqui também mandaria a stanza em duplicidade.
+	if e.ehDaPonte(ev.CallID) {
+		return
+	}
 	m := e.lookup(ev.CallID)
 	if m == nil || m.direction != CallDirectionIncoming {
 		return

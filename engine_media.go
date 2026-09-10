@@ -29,6 +29,13 @@ import (
 // maybeStartMedia launches the media loop for callID once both the callKey and the relay
 // endpoint are known. It is idempotent — the loop starts exactly once per call.
 func (e *engine) maybeStartMedia(callID string) {
+	// ⛔ Chamada da PONTE: quem cuida da mídia e da sinalização é o motor whatsapp.wasm.
+	// Se o meowcaller também agir aqui, os dois disputam o mesmo relay (ele assina com o
+	// SSRC dele, responde relaylatency em duplicidade e sobe a mídia dele) — a inscrição do
+	// motor não completa e o áudio do cliente não vem. Medido em 10/09.
+	if e.ehDaPonte(callID) {
+		return
+	}
 	e.mu.Lock()
 	m := e.calls[callID]
 	if m == nil || m.started || m.callKey == nil || m.relay == nil {
@@ -1074,11 +1081,16 @@ const videoRtpStepSamples = 90000 / 15
 // mgrBroadcastChannel adapta o SctpRelayManager (Broadcast pra todos os relays) à interface
 // RelayChannel, pra o videoSender TX mandar os pacotes PT-97 pelo mesmo transporte multi-relay
 // do áudio. Recv nunca é chamado neste canal (é só TX).
-type mgrBroadcastChannel struct{ mgr *wacallsrelay.SctpRelayManager }
+type mgrBroadcastChannel struct {
+	mgr *wacallsrelay.SctpRelayManager
+}
 
-func (m *mgrBroadcastChannel) Send(data []byte) (int, error) { m.mgr.SendActive(data); return len(data), nil }
-func (m *mgrBroadcastChannel) Recv(buf []byte) (int, error)  { return 0, nil }
-func (m *mgrBroadcastChannel) Close() error                  { return nil }
+func (m *mgrBroadcastChannel) Send(data []byte) (int, error) {
+	m.mgr.SendActive(data)
+	return len(data), nil
+}
+func (m *mgrBroadcastChannel) Recv(buf []byte) (int, error) { return 0, nil }
+func (m *mgrBroadcastChannel) Close() error                 { return nil }
 
 // videoSender packetizes encoded H.264 access units (Annex-B) into PT-97 RTP, E2E-SRTP
 // protects them with the video pipeline, and sends them to the relay. The send path is
