@@ -28,6 +28,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/purpshell/meowcaller/lidbin"
 	"github.com/rs/zerolog"
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/types"
@@ -112,11 +113,12 @@ func (p *pontewasm) oferta(ev *events.CallOffer, callKey []byte) {
 		}
 		copia.Content = novos
 	}
-	raw, err := waBinary.Marshal(copia)
-	if err != nil {
-		p.log.Error().Err(err).Msg("não consegui serializar a oferta pro motor")
-		return
-	}
+	// ⭐ NÃO é o Marshal do whatsmeow. Medido em 10/09 contra o motor real, com as 4
+	// combinações possíveis: ele só aceita a oferta quando o JID de LID vem como ADJID
+	// (o whatsmeow manda JIDPair quando o device é 0, e aí o motor lê o creator como
+	// @s.whatsapp.net e descarta: "mismatched peer id and creator id") E quando o byte
+	// de flags está presente (sem ele não parseia nada).
+	raw := lidbin.MarshalParaWasm(copia, true)
 
 	// O motor casa o peerJid com o call-creator de DENTRO da stanza; quem manda é o creator.
 	peer := ev.CallCreator
@@ -128,15 +130,23 @@ func (p *pontewasm) oferta(ev *events.CallOffer, callKey []byte) {
 	p.creators[ev.CallID] = peer
 	p.mu.Unlock()
 
-	_, err = p.postar("/offer", map[string]any{
+	// tcToken (privacy token do chamador): o SheIITear passa e a ponte não passava.
+	// Medido na referência: 11 bytes. Best-effort — sem ele o motor ainda aceita a oferta.
+	corpo := map[string]any{
 		"callId":         ev.CallID,
 		"payloadWasm":    base64.StdEncoding.EncodeToString(raw),
 		"peerJid":        peer.String(),
 		"peerPlatform":   ev.RemotePlatform,
 		"peerAppVersion": ev.RemoteVersion,
 		"timestamp":      fmt.Sprintf("%d", ev.Timestamp.Unix()),
-	})
-	if err != nil {
+	}
+	if st := p.e.c.wa.Store; st != nil && st.PrivacyTokens != nil {
+		if pt, errTok := st.PrivacyTokens.GetPrivacyToken(context.Background(), peer.ToNonAD()); errTok == nil && pt != nil && len(pt.Token) > 0 {
+			corpo["tcToken"] = base64.StdEncoding.EncodeToString(pt.Token)
+			p.log.Debug().Int("bytes", len(pt.Token)).Msg("tcToken do chamador anexado")
+		}
+	}
+	if _, err := p.postar("/offer", corpo); err != nil {
 		p.log.Error().Err(err).Str("call_id", ev.CallID).Msg("sidecar recusou a oferta")
 		return
 	}
@@ -169,10 +179,7 @@ func (p *pontewasm) sinalBruto(node *waBinary.Node) {
 	if filho.Tag == "offer" {
 		return // a oferta vai por p.oferta(), com a chave em claro
 	}
-	raw, err := waBinary.Marshal(filho)
-	if err != nil {
-		return
-	}
+	raw := lidbin.MarshalParaWasm(filho, true)
 	ag := node.AttrGetter()
 	cag := filho.AttrGetter()
 	callID := cag.String("call-id")
@@ -207,10 +214,7 @@ func (p *pontewasm) ackBruto(node *waBinary.Node, msgType string) {
 	if node == nil {
 		return
 	}
-	raw, err := waBinary.Marshal(*node)
-	if err != nil {
-		return
-	}
+	raw := lidbin.MarshalParaWasm(*node, true)
 	ag := node.AttrGetter()
 	tipo := msgType
 	if tipo == "" {
@@ -244,10 +248,7 @@ func (p *pontewasm) recibo(node *waBinary.Node) {
 	if callID == "" {
 		return // recibo de mensagem comum, não é da chamada
 	}
-	raw, err := waBinary.Marshal(*node)
-	if err != nil {
-		return
-	}
+	raw := lidbin.MarshalParaWasm(*node, true)
 	ag := node.AttrGetter()
 	peer := cag.OptionalString("call-creator")
 	if peer == "" {
