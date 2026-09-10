@@ -15,6 +15,13 @@ type Call struct {
 	id   string
 	peer types.JID
 
+	// viaPonte: a mídia e a sinalização desta chamada são do motor whatsapp.wasm (sidecar),
+	// não do meowcaller. Play/Receive/Answer/Hangup continuam com a MESMA semântica pra quem
+	// chama — é o que deixa o gateway, o WS do navegador, a gravação e a transferência
+	// funcionarem sem saber que trocaram de motor.
+	viaPonte bool
+	cano     *canoAudio
+
 	mu           sync.Mutex
 	phase        CallPhase
 	player       *Player

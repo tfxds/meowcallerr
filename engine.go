@@ -1,22 +1,22 @@
 package meowcaller
 
 import (
-	"github.com/rs/zerolog"
-	"time"
-	"path/filepath"
-	"os"
-	"encoding/json"
-	"encoding/base64"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/rs/zerolog"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unsafe"
 
 	"github.com/purpshell/meowcaller/signaling"
@@ -302,7 +302,25 @@ func (e *engine) onOffer(ev *events.CallOffer) {
 	// de o relay entregar a voz do cliente pra gente. Desligada (padrão), segue o fluxo
 	// de sempre e nada muda. O outbound nunca passa por aqui.
 	if pontewasmLigada() {
+		peerP := ev.CallCreator
+		if peerP.IsEmpty() {
+			peerP = ev.From
+		}
+		chamada := &Call{eng: e, id: ev.CallID, peer: peerP, phase: CallPhaseRinging, viaPonte: true}
+		e.mu.Lock()
+		mp := e.entry(ev.CallID)
+		mp.call = chamada
+		mp.callKey = callKey
+		mp.creator = ev.CallCreator
+		mp.from = ev.From
+		mp.direction = CallDirectionIncoming
+		e.mu.Unlock()
 		e.pw().oferta(ev, callKey)
+		// Daqui pra frente é idêntico ao caminho de sempre: o gateway toca no navegador,
+		// o atendente pega, e Answer/CommitAccept/Hangup caem nos ramos da ponte.
+		if fn := e.c.incomingCallHandler(); fn != nil {
+			fn(chamada)
+		}
 		return
 	}
 	e.c.diag.Emit("keying", map[string]any{
@@ -404,6 +422,12 @@ func (e *engine) answer(c *Call) error {
 	if m == nil {
 		return fmt.Errorf("meowcaller: unknown call %s", c.id)
 	}
+	// Ponte: o motor manda o <preaccept> sozinho ao receber a oferta, e a mídia dele já
+	// sobe junto. Não há nada a fazer aqui — o <accept> de verdade sai no CommitAccept.
+	if c.viaPonte {
+		c.setPhase(CallPhaseConnecting)
+		return nil
+	}
 	// Preaccept AGORA (no pickup), não na chegada do offer — assim o celular do chamador toca
 	// até o atendente pegar de verdade. Aqui já temos from/creator (setados no onOffer).
 	if err := e.sendPreaccept(c.id, m.from, m.creator); err != nil {
@@ -429,6 +453,26 @@ func (e *engine) commitAccept(callID string) error {
 	e.mu.Unlock()
 	if m == nil {
 		return fmt.Errorf("meowcaller: unknown call %s", callID)
+	}
+	// Ponte: é AQUI que o celular do chamador para de tocar — o motor só manda o <accept>
+	// quando o atendente pega de verdade. E é aqui que o áudio começa a andar.
+	if m.call != nil && m.call.viaPonte {
+		p := e.pw()
+		if cano, err := p.abrirCanoAudio(m.call); err != nil {
+			p.log.Error().Err(err).Str("call_id", callID).Msg("não consegui abrir o cano de áudio")
+		} else {
+			e.mu.Lock()
+			m.call.cano = cano
+			e.mu.Unlock()
+		}
+		if _, err := p.postar("/accept", map[string]any{"callId": callID}); err != nil {
+			return fmt.Errorf("accept no motor: %w", err)
+		}
+		m.call.setPhase(CallPhaseActive)
+		if fn := m.call.onReadyFn(); fn != nil {
+			fn()
+		}
+		return nil
 	}
 	e.maybeSendAccept(callID)
 	return nil
@@ -504,6 +548,9 @@ func (e *engine) sendAccept(callID string, to, creator types.JID) {
 
 // reject declines an inbound call.
 func (e *engine) reject(c *Call) error {
+	if c.viaPonte {
+		return e.encerraPelaPonte(c, "rejected")
+	}
 	m := e.lookup(c.id)
 	to, creator := c.peer, c.peer
 	if m != nil {
@@ -524,6 +571,9 @@ func (e *engine) reject(c *Call) error {
 
 // hangup ends a call (either direction) and tears down its media.
 func (e *engine) hangup(c *Call) error {
+	if c.viaPonte {
+		return e.encerraPelaPonte(c, "hangup")
+	}
 	m := e.lookup(c.id)
 	to, creator := c.peer, c.peer
 	if m != nil {

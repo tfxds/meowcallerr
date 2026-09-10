@@ -153,9 +153,10 @@ func (p *pontewasm) oferta(ev *events.CallOffer, callKey []byte) {
 	p.log.Info().Str("call_id", ev.CallID).Int("bytes", len(raw)).Str("peer", peer.String()).
 		Msg("⭐ oferta entregue ao motor whatsapp.wasm — a chamada é dele agora")
 
-	// Milestone 1: atende sozinho, pra medir se o áudio do cliente finalmente chega.
-	// (Com a ponte ligada não há toque no navegador — é uma chave de teste.)
-	if os.Getenv("WHATSMEOW_WASM_BRIDGE_AUTOACCEPT") != "0" {
+	// Quem atende agora é o ATENDENTE (o gateway chama CommitAccept no pickup). O
+	// auto-atendimento sobrou só como ferramenta de medição, e por isso nasce DESLIGADO —
+	// ligado, ele rouba a chamada antes de tocar no navegador.
+	if os.Getenv("WHATSMEOW_WASM_BRIDGE_AUTOACCEPT") == "1" {
 		go func() {
 			time.Sleep(1200 * time.Millisecond)
 			if _, err := p.postar("/accept", map[string]any{"callId": ev.CallID}); err != nil {
@@ -396,11 +397,65 @@ func (p *pontewasm) enviarResposta(r saidaWasm) {
 	}()
 }
 
-// encerrou avisa o motor que a chamada morreu e limpa o mapa.
+// encerrou é o caminho de quando quem desliga é o CLIENTE (chegou <terminate>): fecha o
+// áudio, avisa o OnEnd (que faz a UI parar de tocar / o navegador soltar) e limpa tudo.
 func (p *pontewasm) encerrou(callID string) {
 	p.mu.Lock()
 	delete(p.peers, callID)
 	delete(p.creators, callID)
 	p.mu.Unlock()
+
+	e := p.e
+	e.mu.Lock()
+	m := e.calls[callID]
+	var c *Call
+	if m != nil {
+		c = m.call
+	}
+	var cano *canoAudio
+	if c != nil {
+		cano = c.cano
+		c.cano = nil
+	}
+	delete(e.calls, callID)
+	e.mu.Unlock()
+
+	if cano != nil {
+		cano.fechar()
+	}
 	_, _ = p.postar("/hangup", map[string]any{"callId": callID})
+	if c != nil {
+		c.setPhase(CallPhaseEnded)
+		if fn := c.onEndFn(); fn != nil {
+			fn("hangup")
+		}
+	}
+}
+
+// encerraPelaPonte fecha o áudio, manda o motor derrubar a chamada (ele emite o
+// <terminate>) e avisa quem estava ouvindo. É o Hangup/Reject do caminho da ponte.
+func (e *engine) encerraPelaPonte(c *Call, motivo string) error {
+	e.mu.Lock()
+	cano := c.cano
+	c.cano = nil
+	e.mu.Unlock()
+	if cano != nil {
+		cano.fechar()
+	}
+	p := e.pw()
+	p.mu.Lock()
+	delete(p.peers, c.id)
+	delete(p.creators, c.id)
+	p.mu.Unlock()
+	if _, err := p.postar("/hangup", map[string]any{"callId": c.id, "enviarTerminate": true}); err != nil {
+		p.log.Warn().Err(err).Str("call_id", c.id).Msg("hangup no motor falhou")
+	}
+	e.mu.Lock()
+	delete(e.calls, c.id)
+	e.mu.Unlock()
+	c.setPhase(CallPhaseEnded)
+	if fn := c.onEndFn(); fn != nil {
+		fn(motivo)
+	}
+	return nil
 }
