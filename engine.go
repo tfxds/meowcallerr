@@ -466,6 +466,31 @@ func (e *engine) commitAccept(callID string) error {
 	if m == nil {
 		return fmt.Errorf("meowcaller: unknown call %s", callID)
 	}
+	// ⭐ mute_v2 DO CALLEE (nosso). O motor real manda um `<mute_v2>` pro chamador na
+	// sequência preaccept → relaylatency → mute_v2 → accept — capturado do fio em 10/09.
+	// O meowcaller (e o upstream dele) têm BuildMuteV2 e NUNCA chamam: os dois só ESPERAM
+	// receber um do chamador pra então mandar o accept. Se o chamador só manda o dele em
+	// RESPOSTA ao nosso, a espera nunca termina — o que casa com o accept que não sai.
+	// WHATSMEOW_SEND_MUTE=1 liga; WHATSMEOW_MUTE_STATE ajusta o valor do atributo.
+	if os.Getenv("WHATSMEOW_SEND_MUTE") == "1" && m.call != nil && !m.call.viaPonte {
+		estado := os.Getenv("WHATSMEOW_MUTE_STATE")
+		if estado == "" {
+			estado = "0"
+		}
+		mv := signaling.BuildMuteV2(callID, m.from, m.creator, estado)
+		mv.Attrs["id"] = e.c.wa.DangerousInternals().GenerateRequestID()
+		if err := e.c.wa.DangerousInternals().SendNode(context.Background(), mv); err != nil {
+			e.c.log.Warn().Err(err).Str("call_id", callID).Msg("[MUTE] envio do nosso mute_v2 falhou")
+		} else {
+			e.c.log.Info().Str("call_id", callID).Str("mute_state", estado).
+				Msg("[MUTE] mandamos o nosso mute_v2 (como o motor real faz)")
+		}
+		// Não ficamos reféns do mute_v2 do chamador: quem dita a sequência agora somos nós.
+		e.mu.Lock()
+		m.muteSeen = true
+		e.mu.Unlock()
+	}
+
 	// Ponte: é AQUI que o celular do chamador para de tocar — o motor só manda o <accept>
 	// quando o atendente pega de verdade. E é aqui que o áudio começa a andar.
 	if m.call != nil && m.call.viaPonte {
@@ -672,6 +697,28 @@ func (e *engine) onRelayLatency(ev *events.CallRelayLatency) {
 	if rl == nil {
 		return
 	}
+	// ⭐ SÓ responde sondas de relays que estavam NA OFERTA.
+	//
+	// O chamador inclui nas sondas a borda mais próxima DELE (ex: `fccm1c01`), que não veio
+	// na nossa oferta e para a qual não temos token nenhum. Ecoar essa entrada de volta
+	// ENDOSSA um relay onde a gente nunca vai conseguir receber — e o celular, que roda a
+	// eleição de relay logo depois do accept, MIGRA a mídia pra lá. É por isso que o áudio
+	// morre ~150ms depois da primeira rodada de relaylatency: os 5-8 pacotes que todo mundo
+	// vê são o burst de ANTES da migração.
+	//
+	// Diagnóstico e correção: PR #26 do purpshell/meowcaller (issues #21/#22/#24), validada
+	// em produção por terceiros. ⚠️ Eu tinha interpretado essa pista ao contrário.
+	// WHATSMEOW_RELAY_FILTER=0 volta ao comportamento antigo (ecoar tudo).
+	daOferta := map[string]bool{}
+	if m.relay != nil {
+		for i := range m.relay.endpoints {
+			if n := m.relay.endpoints[i].relayName; n != "" {
+				daOferta[n] = true
+			}
+		}
+	}
+	filtrar := os.Getenv("WHATSMEOW_RELAY_FILTER") != "0" && len(daOferta) > 0
+
 	var probes []rlProbe
 	for i := range rl.GetChildren() {
 		te := &rl.GetChildren()[i]
@@ -679,9 +726,15 @@ func (e *engine) onRelayLatency(ev *events.CallRelayLatency) {
 			continue
 		}
 		ag := te.AttrGetter()
+		nome := ag.String("relay_name")
+		if filtrar && !daOferta[nome] {
+			e.c.log.Info().Str("call_id", ev.CallID).Str("relay", nome).
+				Msg("[RELAY-FILTER] sonda de relay que NÃO veio na oferta — ignorada (não endossar)")
+			continue
+		}
 		probes = append(probes, rlProbe{
 			latency:   decodeLatency(ag.String("latency")),
-			relayName: ag.String("relay_name"),
+			relayName: nome,
 			addr:      nodeBytes(te),
 		})
 	}
