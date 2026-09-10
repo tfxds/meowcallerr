@@ -1,6 +1,12 @@
 package meowcaller
 
 import (
+	"github.com/rs/zerolog"
+	"time"
+	"path/filepath"
+	"os"
+	"encoding/json"
+	"encoding/base64"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
@@ -269,6 +275,13 @@ func (e *engine) onOffer(ev *events.CallOffer) {
 		return
 	}
 	e.c.log.Info().Int("key_bytes", len(callKey)).Str("call_id", ev.CallID).Msg("decrypted inbound callKey")
+	// Captura a oferta no formato que o motor whatsapp.wasm consome: o mesmo <offer>, mas com
+	// o conteúdo do <enc> trocado pela CHAVE EM CLARO (é o que o SheIITear faz em
+	// #maybeDecryptEnc antes de entregar ao WASM). Só grava arquivo, numa CÓPIA do nó — não
+	// encosta no nó que a chamada real usa. Ligado por WHATSMEOW_DUMP_CALL_STANZAS=1.
+	if os.Getenv("WHATSMEOW_DUMP_CALL_STANZAS") == "1" {
+		go dumpOfertaProWasm(e.c.log, ev, callKey)
+	}
 	e.c.diag.Emit("keying", map[string]any{
 		"call_id": ev.CallID, "direction": "in", "from": ev.From.String(),
 		"call_key_hex": hex.EncodeToString(callKey),
@@ -1263,4 +1276,51 @@ func getMediaRelayEndpoint(rd *relayData, inbound bool) *relayEndpoint {
 		return &rd.endpoints[0]
 	}
 	return nil
+}
+
+// dumpOfertaProWasm grava a oferta com a chave da chamada em claro, no formato do
+// handleIncomingSignalingOffer. Best-effort e isolado do fluxo da chamada.
+func dumpOfertaProWasm(log zerolog.Logger, ev *events.CallOffer, callKey []byte) {
+	defer func() { _ = recover() }()
+	if ev == nil || ev.Data == nil {
+		return
+	}
+	// Cópia rasa + filhos: trocar o <enc> no nó ORIGINAL quebraria a chamada em andamento.
+	copia := *ev.Data
+	if kids, ok := ev.Data.Content.([]waBinary.Node); ok {
+		novos := make([]waBinary.Node, len(kids))
+		copy(novos, kids)
+		for i := range novos {
+			if novos[i].Tag == "enc" {
+				novos[i].Content = append([]byte(nil), callKey...)
+			}
+		}
+		copia.Content = novos
+	}
+	raw, err := waBinary.Marshal(copia)
+	if err != nil {
+		return
+	}
+	dir := "/var/lib/whatsmeow-gateway/callstanzas"
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return
+	}
+	rec := map[string]any{
+		"callId":         ev.CallID,
+		"payloadWasm":    base64.StdEncoding.EncodeToString(raw),
+		"callKeyHex":     hex.EncodeToString(callKey),
+		"peerJid":        ev.From.String(),
+		"callCreator":    ev.CallCreator.String(),
+		"callCreatorAlt": ev.CallCreatorAlt.String(),
+		"peerPlatform":   ev.RemotePlatform,
+		"peerAppVersion": ev.RemoteVersion,
+		"timestamp":      ev.Timestamp.UTC().Format(time.RFC3339),
+	}
+	b, err := json.MarshalIndent(rec, "", "  ")
+	if err != nil {
+		return
+	}
+	if err := os.WriteFile(filepath.Join(dir, ev.CallID+"-wasm.json"), b, 0o644); err == nil {
+		log.Info().Str("call_id", ev.CallID).Int("bytes", len(raw)).Msg("[DUMP] oferta pronta pro WASM gravada")
+	}
 }
