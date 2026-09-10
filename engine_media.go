@@ -17,6 +17,7 @@ import (
 	"github.com/purpshell/meowcaller/mlow"
 	"github.com/purpshell/meowcaller/relay"
 	"github.com/purpshell/meowcaller/rtp"
+	"github.com/purpshell/meowcaller/srtp"
 	"github.com/purpshell/meowcaller/stun"
 	"github.com/purpshell/meowcaller/wacallsrelay"
 )
@@ -1046,10 +1047,32 @@ func (e *engine) runMediaWacalls(ctx context.Context, callID string, call *Call,
 	mgr.ConfigureRelays(configs)
 	log.Info().Int("relays", len(configs)).Int("connected", mgr.ConnectedCount()).Msg("[WACALLS] relays configurados (multi-relay)")
 
+	// ⭐ RTCP: o motor real (whatsapp.wasm) manda Sender Report o tempo todo — capturado do
+	// fio em 10/09: PT 200 (SR), 205 (RTPFB), 206 (PSFB) e o compacto 208 da WhatsApp. O
+	// meowcaller NUNCA mandou nenhum: os construtores existiam em rtp/rtcp.go e ninguém
+	// chamava. Num SFU, receptor que não dá feedback é considerado morto e o relay para de
+	// encaminhar — o que casa com o sintoma de ~7 pacotes e silêncio.
+	// Cadeia portada do upstream (c27a5f8, fbeb716, 6e530f7). WHATSMEOW_RTCP=1 liga.
+	rtcpLigado := os.Getenv("WHATSMEOW_RTCP") == "1"
+	var chavesRtcp srtp.E2eSrtpKeys
+	var rtcpIndex uint32
+	if rtcpLigado {
+		if k, kerr := srtp.DeriveE2eSrtcpKeys(callKey, rtp.FormatE2ESrtpParticipantID(selfLID), log); kerr != nil {
+			log.Warn().Err(kerr).Msg("[RTCP] não consegui derivar as chaves SRTCP — segue sem RTCP")
+			rtcpLigado = false
+		} else {
+			chavesRtcp = k
+			log.Info().Uint32("ssrc", ssrc).Msg("[RTCP] enviando Sender Report periódico (experimento)")
+		}
+	}
+
 	// TX: frame-paced, broadcast pra TODOS os relays (o relay que serve o peer recebe).
 	frameInterval := time.Duration(FrameSamples) * time.Second / SampleRate
 	ticker := time.NewTicker(frameInterval)
 	defer ticker.Stop()
+	// Um SR por segundo (a cada ~17 frames de 60 ms).
+	const framesPorRtcp = 17
+	var framesDesdeRtcp int
 	silence := make([]float32, FrameSamples)
 	for {
 		select {
@@ -1072,6 +1095,20 @@ func (e *engine) runMediaWacalls(ctx context.Context, callID string, call *Call,
 			continue
 		}
 		mgr.Broadcast(packet)
+
+		if rtcpLigado {
+			if framesDesdeRtcp++; framesDesdeRtcp >= framesPorRtcp {
+				framesDesdeRtcp = 0
+				stats := txPipe.SenderStats()
+				sr := rtp.BuildSenderReport(ssrc, &stats, uint64(time.Now().UnixMilli()))
+				rtcpIndex++
+				if protegido, rerr := srtp.ProtectSrtcp(&chavesRtcp, ssrc, rtcpIndex, sr[:]); rerr == nil {
+					mgr.Broadcast(protegido)
+				} else {
+					log.Debug().Err(rerr).Msg("[RTCP] protect falhou")
+				}
+			}
+		}
 	}
 }
 
