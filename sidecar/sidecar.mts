@@ -134,12 +134,33 @@ const PEER_DOMINIO = process.env.PEER_DOMINIO === "pn" ? "s.whatsapp.net" : "lid
 const peerParaOMotor = (jid: string) =>
   String(jid || "").split("@")[0].split(":")[0] + ":0@" + PEER_DOMINIO;
 
+/**
+ * Anota os SSRC que o motor REAL usa, lidos direto do RTP (bytes 8-11, big-endian).
+ * Serve pra responder uma pergunta específica: a derivação de SSRC do meowcaller
+ * (HKDF salt=slot, ikm=callID, info=jid) alguma vez bate com o que o motor faz? Se bater,
+ * o caminho nativo em Go volta a ser possível e o sidecar deixa de ser necessário.
+ * Loga UMA vez por SSRC distinto, pra não poluir.
+ */
+const ssrcVistos = new Set<string>();
+function anotaSsrc(data: Uint8Array, lado: "NOSSO" | "PEER") {
+  if (!data || data.length < 12) return;
+  if ((data[0] & 0xc0) !== 0x80) return; // não é RTP (STUN/consent começa com 0x00/0x01)
+  const pt = data[1] & 0x7f;
+  const ssrc = ((data[8] << 24) | (data[9] << 16) | (data[10] << 8) | data[11]) >>> 0;
+  const chave = `${lado}:${ssrc}`;
+  if (ssrcVistos.has(chave)) return;
+  ssrcVistos.add(chave);
+  log(`🔎 SSRC ${lado} = 0x${ssrc.toString(16).padStart(8, "0")} (pt=${pt}) call=${atual?.callId || "?"}`);
+}
+
 async function subirMotor() {
   log("subindo o motor whatsapp.wasm...");
 
   relay = new RelayRtcTransport({
-    onTransportMessage: (data: Uint8Array, ip: string, port: number) =>
-      engine?.handleOnTransportMessage(data, ip, port),
+    onTransportMessage: (data: Uint8Array, ip: string, port: number) => {
+      anotaSsrc(data, "PEER");
+      engine?.handleOnTransportMessage(data, ip, port);
+    },
     onIceRtt: (rtt: number, ip: string, port: number) => engine?.updateIceRtt(rtt, ip, port),
   });
 
@@ -152,7 +173,10 @@ async function subirMotor() {
         log(`📤 motor quer enviar ${xml.length}b em ${callId} (fila=${fila.length}) hex=${
           Buffer.from(xml).slice(0, 24).toString("hex")}`);
       },
-      sendDataToRelay: (data: Uint8Array, ip: string, port: number) => relay?.send(data, ip, port),
+      sendDataToRelay: (data: Uint8Array, ip: string, port: number) => {
+        anotaSsrc(data, "NOSSO");
+        relay?.send(data, ip, port);
+      },
       onCallEvent: (tipo: number, dados?: string) => aoEventoDoMotor(tipo, dados),
       onAudioCaptureInit: (cfg: any) => {
         capSamples = (cfg?.framesPerChunk || 320) * (cfg?.channels || 1);
@@ -270,7 +294,7 @@ http.createServer(async (req, res) => {
       log(`♻️ descartando a chamada anterior ${atual.callId} antes da nova`);
       try { engine.endCall(0, false); } catch {}
       try { relay?.closeAll(); } catch {}
-      filaMic = []; sobraMic = new Float32Array(0);
+      filaMic = []; sobraMic = new Float32Array(0); ssrcVistos.clear();
       await new Promise(r => setTimeout(r, 150));
     }
     const peer = peerParaOMotor(b.peerJid);
