@@ -913,11 +913,17 @@ func (e *engine) runMediaWacalls(ctx context.Context, callID string, call *Call,
 	}
 	defer mgr.Cleanup()
 
-	var rtpIn, rtpSeen, nonRtp atomic.Uint64
+	var rtpIn, rtpSeen, nonRtp, rtpDup atomic.Uint64
 	var actualPeerSet atomic.Bool
+	// Descarte de duplicados por (SSRC, seq) — ver o comentário no handler de RX.
+	const dedupJanela = 512
+	dedupLigado := os.Getenv("WHATSMEOW_RX_DEDUP") != "0"
+	dedupVistos := make(map[uint64]struct{}, dedupJanela)
+	dedupOrdem := make([]uint64, 0, dedupJanela)
+	var dedupMu sync.Mutex
 	defer func() {
 		log.Info().Uint64("relays", uint64(len(configs))).Uint64("rtpSeen", rtpSeen.Load()).
-			Uint64("nonRtp", nonRtp.Load()).Uint64("rtpIn", rtpIn.Load()).
+			Uint64("nonRtp", nonRtp.Load()).Uint64("dup", rtpDup.Load()).Uint64("rtpIn", rtpIn.Load()).
 			Msg("[WACALLS-SUMMARY] recebidos-RTP vs nao-RTP vs decodificados")
 	}()
 
@@ -1018,6 +1024,32 @@ func (e *engine) runMediaWacalls(ctx context.Context, callID string, call *Call,
 		rxSsrc := uint32(data[8])<<24 | uint32(data[9])<<16 | uint32(data[10])<<8 | uint32(data[11])
 		if rxSsrc == ssrc {
 			return // nosso próprio stream ecoado
+		}
+		// ⭐ DUPLICADOS: a gente conecta em TODOS os relays oferecidos, então o MESMO pacote
+		// chega uma vez por relay. Entregar a duplicata ao playout reseta o buffer (timestamp
+		// repetido) e pica o áudio. Descarta por (SSRC, seq) — janela curta, só o suficiente
+		// pra pegar a cópia do relay irmão. Alertado na PR #26 do upstream.
+		// WHATSMEOW_RX_DEDUP=0 desliga.
+		if dedupLigado {
+			seq := uint16(data[2])<<8 | uint16(data[3])
+			chave := uint64(rxSsrc)<<16 | uint64(seq)
+			dedupMu.Lock()
+			_, repetido := dedupVistos[chave]
+			if !repetido {
+				dedupVistos[chave] = struct{}{}
+				dedupOrdem = append(dedupOrdem, chave)
+				if len(dedupOrdem) > dedupJanela {
+					delete(dedupVistos, dedupOrdem[0])
+					dedupOrdem = dedupOrdem[1:]
+				}
+			}
+			dedupMu.Unlock()
+			if repetido {
+				if n := rtpDup.Add(1); n == 1 || n%100 == 0 {
+					log.Info().Uint64("descartados", n).Msg("[DEDUP] pacote duplicado do relay irmão")
+				}
+				return
+			}
 		}
 		// actualPeerSet: 1º pacote real do peer → re-assina o SSRC real (WaCalls onRelayData).
 		if actualPeerSet.CompareAndSwap(false, true) && rxSsrc != peerSsrc {
