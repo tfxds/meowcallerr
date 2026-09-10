@@ -160,12 +160,14 @@ func TestMediaPipelineTracksSenderStats(t *testing.T) {
 		t.Fatalf("pipe: %v", err)
 	}
 	header := rtp.RtpHeader{
-		Marker:         true,
-		PayloadType:    rtp.RtpPayloadTypeH264,
+		Marker: true,
+		// Áudio (Opus), não vídeo: o teste é das ESTATÍSTICAS de RTCP. O upstream monta
+		// isso com um cabeçalho de vídeo, mas os símbolos de extensão de vídeo vêm de outro
+		// commit que não faz parte desta cadeia — e o que se testa aqui independe disso.
+		PayloadType:    rtp.RtpPayloadTypeOpus,
 		SequenceNumber: 0,
 		Timestamp:      90000,
 		Ssrc:           0x12345678,
-		VideoExtension: &rtp.VideoRtpExtension{MediaFrameInfo: rtp.VideoMediaFrameInfoIDR},
 	}
 	if _, err := pipe.ProtectRTP(&header, []byte{0x65, 1, 2, 3}); err != nil {
 		t.Fatalf("protect: %v", err)

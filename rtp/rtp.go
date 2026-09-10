@@ -11,7 +11,11 @@ import (
 // profile 0xdebe), Opus payload classifiers, and the send-side sequencer.
 
 const (
-	RtpPayloadTypeOpus          uint8  = 120
+	RtpPayloadTypeOpus uint8 = 120
+	// RtpPayloadTypeH264 é o payload type do vídeo (H.264). Não veio no rtp.go novo do
+	// upstream (lá o vídeo migrou pra outro commit, fora desta cadeia de RTCP), mas o nosso
+	// engine_media.go demultiplexa áudio/vídeo por ele. Mantido como adição local.
+	RtpPayloadTypeH264          uint8  = 97
 	WhatsappRtpExtensionProfile uint16 = 0xdebe
 	WhatsappRtpHeaderSize       int    = 16
 	WhatsappRtpHeaderDtxSize    int    = 20
