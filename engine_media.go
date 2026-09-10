@@ -370,7 +370,16 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	// subscription to the peer's SSRC, or the relay bridges only a brief initial burst then
 	// stops (inbound RX dies). Burst over the first ~5s and refreshed on the keepalive. Ported
 	// from WaCalls.
-	if isInbound {
+	// EXPERIMENTO (env WHATSMEOW_INBOUND_NO_CONSENT=1): não mandar consent no inbound.
+	// Motivo: no OUTBOUND a gente não manda consent nenhum e o relay entrega a mídia do peer
+	// sem problema; no INBOUND a gente manda a rajada e recebe ~8 pacotes. Toda a investigação
+	// partiu de "o callee PRECISA assinar" — nunca foi testado fazer igual ao outbound.
+	// Reversível por env, sem recompilar.
+	semConsent := os.Getenv("WHATSMEOW_INBOUND_NO_CONSENT") == "1"
+	if isInbound && semConsent {
+		log.Warn().Msg("[EXPERIMENTO] inbound SEM ICE-consent (igual ao outbound) — WHATSMEOW_INBOUND_NO_CONSENT=1")
+	}
+	if isInbound && !semConsent {
 		anyConsent := false
 		for _, rc := range conns {
 			if rc.consentUsername == "" {
