@@ -299,6 +299,14 @@ func (e *engine) onOffer(ev *events.CallOffer) {
 	m.isVideo = isVideo
 	if r := findRelay(ev.Data); r != nil {
 		m.relay = parseRelayData(r)
+		// Participantes vêm do nó do OFFER (irmãos do <relay>), com o device — é deles que
+		// sai o SSRC do stream do peer.
+		m.relay.participantJIDs = coletaParticipantes(ev.Data)
+		// DIAG: se a lista vier vazia, imprime a árvore de tags do offer pra achar onde os
+		// participantes estão de fato (em vez de adivinhar de novo).
+		if len(m.relay.participantJIDs) == 0 {
+			e.c.log.Warn().Str("arvore", resumoTags(ev.Data, 0)).Msg("[SSRC-DIAG] offer sem participantes — estrutura do nó")
+		}
 		if !m.relay.peerJID.IsEmpty() {
 			m.peerLID = m.relay.peerJID.String()
 		}
@@ -506,6 +514,7 @@ func (e *engine) onRelay(callID string, data *waBinary.Node) {
 		return
 	}
 	rd := parseRelayData(r)
+	rd.participantJIDs = coletaParticipantes(data)
 	var peerLID string
 	var jaComecou bool
 	e.mu.Lock()
@@ -1109,23 +1118,6 @@ func parseRelayData(node *waBinary.Node) *relayData {
 	peerPID := node.AttrGetter().String("peer_pid")
 	for i := range kids {
 		child := &kids[i]
-		// Lista de participantes com device — o WaCalls monta a mesma lista (relayack.go
-		// addParticipant) e é DELA que ele tira o SSRC do peer. Sem isso a gente derivava do
-		// "from" do offer e o número nunca batia com o stream real.
-		if child.Tag == "user" {
-			for _, dev := range child.GetChildren() {
-				if dev.Tag == "device" {
-					if j := dev.AttrGetter().String("jid"); j != "" {
-						rd.participantJIDs = append(rd.participantJIDs, j)
-					}
-				}
-			}
-		}
-		if child.Tag == "participant" {
-			if j := child.AttrGetter().String("jid"); j != "" {
-				rd.participantJIDs = append(rd.participantJIDs, j)
-			}
-		}
 		if child.Tag == "participant" && peerPID != "" && child.AttrGetter().String("pid") == peerPID {
 			rd.peerJID = child.AttrGetter().JID("jid")
 			continue
@@ -1157,6 +1149,65 @@ func parseRelayData(node *waBinary.Node) *relayData {
 // any non-FNA, else the first. For an inbound call the caller's uplink RTP lands on their
 // FNA-marked relay, so we must allocate on that same relay or the relay never bridges the
 // peer's media (the callee connects but hears nothing).
+// coletaParticipantes junta os JIDs de participante COM DEVICE do nó do offer/relay-stanza.
+// ⚠️ Eles são IRMÃOS do <relay>, não filhos: o WaCalls lê do InnerNode do offer
+// (ParseRelayFromAck), não do nó <relay>. Procurar dentro do <relay> devolve lista vazia —
+// foi o que aconteceu na 1ª tentativa ("<relay> sem lista de participantes").
+func coletaParticipantes(node *waBinary.Node) []string {
+	if node == nil {
+		return nil
+	}
+	var out []string
+	visto := map[string]bool{}
+	add := func(j string) {
+		if j != "" && !visto[j] {
+			visto[j] = true
+			out = append(out, j)
+		}
+	}
+	var anda func(n *waBinary.Node, prof int)
+	anda = func(n *waBinary.Node, prof int) {
+		if n == nil || prof > 3 {
+			return
+		}
+		for _, c := range n.GetChildren() {
+			c := c
+			switch c.Tag {
+			case "device", "participant":
+				add(c.AttrGetter().String("jid"))
+			case "user", "destination", "participants":
+				anda(&c, prof+1)
+			}
+		}
+	}
+	anda(node, 0)
+	return out
+}
+
+// resumoTags imprime a árvore de tags (com os atributos que parecem JID) pra diagnóstico.
+func resumoTags(n *waBinary.Node, prof int) string {
+	if n == nil || prof > 3 {
+		return ""
+	}
+	var b strings.Builder
+	for _, c := range n.GetChildren() {
+		c := c
+		b.WriteString(strings.Repeat(" ", prof))
+		b.WriteString(c.Tag)
+		ag := c.AttrGetter()
+		for _, k := range []string{"jid", "id", "pid", "device", "from", "to"} {
+			if v := ag.String(k); v != "" {
+				b.WriteString("[" + k + "=" + v + "]")
+			}
+		}
+		b.WriteString(" ")
+		if sub := resumoTags(&c, prof+1); sub != "" {
+			b.WriteString("{" + sub + "} ")
+		}
+	}
+	return b.String()
+}
+
 // garanteDevice devolve o JID com device explícito (":0" quando não veio nenhum) — espelha
 // ensureDeviceJid do WaCalls (internal/voip/call/helpers.go).
 func garanteDevice(jid string) string {
