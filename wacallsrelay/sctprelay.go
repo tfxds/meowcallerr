@@ -95,6 +95,8 @@ func NewSctpRelayManager(log *slog.Logger) *SctpRelayManager {
 
 func (m *SctpRelayManager) SetSsrc(ssrc uint32) { m.audioSsrc = ssrc }
 
+var expUmaVez sync.Once
+
 func (m *SctpRelayManager) SetSubscriptionSsrc(ssrc uint32) { m.subscriptionSsrc = ssrc }
 
 func (m *SctpRelayManager) SetOnConnected(fn func(ip string, port int)) { m.onConnected = fn }
@@ -305,15 +307,23 @@ func (m *SctpRelayManager) sendStunRegistration(conn *relayConnection) {
 		}
 		subs := BuildSenderSubscriptions(ssrc)
 
-		if localUfrag != "" {
-			username := []byte(remoteUfrag + ":" + localUfrag)
-			m.sendRaw(conn, BuildBindingRequestWithSubs(username, hmacKey, subs, true, true))
+		// EXPERIMENTO (env WHATSMEOW_INBOUND_NO_CONSENT=1): pula os 3 binding-requests de
+		// assinatura e manda SÓ o allocate — que é exatamente o que o OUTBOUND faz, e no
+		// outbound o relay entrega a mídia do peer sem problema. Este caminho (PATH B) só roda
+		// no inbound, então não precisa checar direção.
+		if os.Getenv("WHATSMEOW_INBOUND_NO_CONSENT") != "1" {
+			if localUfrag != "" {
+				username := []byte(remoteUfrag + ":" + localUfrag)
+				m.sendRaw(conn, BuildBindingRequestWithSubs(username, hmacKey, subs, true, true))
+			}
+			if info.Token != "" && info.Token != remoteUfrag && localUfrag != "" {
+				username := []byte(info.Token + ":" + localUfrag)
+				m.sendRaw(conn, BuildBindingRequestWithSubs(username, hmacKey, subs, true, true))
+			}
+			m.sendRaw(conn, BuildBindingRequestWithSubs(nil, nil, subs, false, false))
+		} else {
+			expUmaVez.Do(func() { fmt.Println("[EXPERIMENTO] PATH B: inbound SEM binding-requests de assinatura (só allocate)") })
 		}
-		if info.Token != "" && info.Token != remoteUfrag && localUfrag != "" {
-			username := []byte(info.Token + ":" + localUfrag)
-			m.sendRaw(conn, BuildBindingRequestWithSubs(username, hmacKey, subs, true, true))
-		}
-		m.sendRaw(conn, BuildBindingRequestWithSubs(nil, nil, subs, false, false))
 
 		if len(info.RawToken) > 0 {
 			var peerSsrcs []uint32
