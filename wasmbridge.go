@@ -332,13 +332,25 @@ func (p *pontewasm) enviarResposta(r saidaWasm) {
 	p.log.Info().Str("tag", acao.Tag).Str("call_id", callID).Str("to", para.String()).
 		Msg("⬆️ stanza do motor enviada")
 
+	// O <ack> do servidor é o que pode TRAZER MAIS RELAYS — é onde o inbound descobre o
+	// relay do chamador (o `fccm1c01` que aparece no relaylatency e não está na nossa
+	// lista). Sem ele o motor fica assinado nos relays errados e nunca recebe o RTP.
 	go func() {
 		select {
 		case ack := <-espera:
-			if ack != nil {
-				p.ackBruto(ack, acao.Tag)
+			if ack == nil {
+				p.log.Warn().Str("tag", acao.Tag).Msg("ack do servidor veio vazio")
+				return
 			}
+			temRelay := findRelay(ack) != nil
+			p.log.Info().Str("resposta_a", acao.Tag).
+				Str("tipo", ack.AttrGetter().String("type")).
+				Str("erro", ack.AttrGetter().String("error")).
+				Bool("traz_relay", temRelay).
+				Msg("⬇️ ack do servidor — repassando ao motor")
+			p.ackBruto(ack, acao.Tag)
 		case <-time.After(20 * time.Second):
+			p.log.Warn().Str("tag", acao.Tag).Msg("⚠️ o servidor NÃO respondeu ack em 20s")
 		}
 	}()
 }
