@@ -379,6 +379,12 @@ func (m *SctpRelayManager) sendStunRegistration(conn *relayConnection) {
 				ssrcList = m.listaPronta
 			}
 			m.sendRaw(conn, BuildAllocateForRelay(info.RawToken, ssrcList, hmacKey, info.IP, info.Port))
+			// 0x0800: a única mensagem que o motor real manda por IPv4 e o meowcaller nunca
+			// mandou (o irmão 0x0803 é IPv6 e o servidor não tem IPv6 — inofensivo).
+			// Ligar com WHATSMEOW_RELAY_BIND=1.
+			if os.Getenv("WHATSMEOW_RELAY_BIND") == "1" {
+				m.sendRaw(conn, BuildWaRelayBind(info.RawToken, hmacKey, info.IP, info.Port))
+			}
 		}
 	}
 

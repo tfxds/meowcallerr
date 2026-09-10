@@ -17,6 +17,11 @@ const (
 	stunBindingRequest  = 0x0001
 	stunAllocateRequest = 0x0003
 	whatsappPing        = 0x0801
+	// waRelayBind (0x0800): mensagem que o motor whatsapp.wasm manda 2× por chamada, em
+	// IPv4, e que o meowcaller nunca mandou. Capturada do fio em 2026-09-10:
+	//   TOKEN(0x4000) + 0x802b(4 bytes zerados) + XOR-RELAYED-ADDRESS(0x0016) + INTEGRITY
+	// (o irmão 0x0803 é a mesma coisa em IPv6 — irrelevante aqui, o servidor não tem IPv6.)
+	waRelayBind = 0x0800
 
 	attrUsername            = 0x0006
 	attrMessageIntegrity    = 0x0008
@@ -26,6 +31,7 @@ const (
 	attrPriority            = 0x0024
 	attrSenderSubscriptions = 0x4000
 	attrSsrcList            = 0x4024
+	attrWaRelayFlags        = 0x802b // 4 bytes zerados no 0x0800 do motor real
 	attrIceControlled       = 0x8029
 	attrIceControlling      = 0x802a
 	attrFingerprint         = 0x8028
@@ -121,6 +127,19 @@ func BuildAllocateForRelay(senderSubscriptions, ssrcList, hmacKey []byte, relayI
 		parts = append(parts, encodeAttribute(attrXorRelayedAddress, encodeXorRelayedAddress(relayIP, relayPort)))
 	}
 	return buildStunMessage(stunAllocateRequest, concat(parts...), txid, hmacKey, false)
+}
+
+// BuildWaRelayBind monta o 0x0800 do motor real: token + 0x802b(zeros) + endereço do
+// relay + MESSAGE-INTEGRITY. Sem lista de SSRC, sem username, sem priority.
+func BuildWaRelayBind(rawToken, hmacKey []byte, relayIP string, relayPort int) []byte {
+	txid := generateTransactionID()
+	var parts [][]byte
+	parts = append(parts, encodeAttribute(attrSenderSubscriptions, rawToken))
+	parts = append(parts, encodeAttribute(attrWaRelayFlags, make([]byte, 4)))
+	if relayIP != "" && relayPort != 0 {
+		parts = append(parts, encodeAttribute(attrXorRelayedAddress, encodeXorRelayedAddress(relayIP, relayPort)))
+	}
+	return buildStunMessage(waRelayBind, concat(parts...), txid, hmacKey, false)
 }
 
 func BuildBindingRequestWithSubs(username, hmacKey, senderSubscriptions []byte, includeIceControlling, includeFingerprint bool) []byte {
