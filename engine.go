@@ -39,6 +39,11 @@ type engine struct {
 
 	mu    sync.Mutex
 	calls map[string]*engineCall // keyed by call-id
+
+	// Ponte pro motor whatsapp.wasm no sidecar (WHATSMEOW_WASM_BRIDGE=1). Guardada sob
+	// mutex próprio: pw() é chamado de dentro de handlers que já podem estar com e.mu.
+	pmu   sync.Mutex
+	ponte *pontewasm
 }
 
 // engineCall is the engine's per-call state: the public Call handle plus the inputs
@@ -104,6 +109,12 @@ func (c *Call) playerAndSink() (*Player, AudioSink) {
 // Call before the whatsmeow client connects.
 func (e *engine) install() {
 	e.installCallAckHook()
+	// Com a ponte ligada, o laço que busca as stanzas do motor tem que estar de pé ANTES
+	// da primeira chamada — senão o que o motor produz nos primeiros segundos fica parado
+	// na fila do sidecar.
+	if pontewasmLigada() {
+		e.pw()
+	}
 	e.c.wa.AddEventHandler(func(evt any) {
 		switch ev := evt.(type) {
 		case *events.CallOffer:
@@ -114,6 +125,10 @@ func (e *engine) install() {
 		case *events.CallTransport:
 			e.onRelay(ev.CallID, ev.Data)
 		case *events.CallTerminate:
+			// Com a ponte ligada, libera o motor pra próxima chamada (ele só toca uma).
+			if pontewasmLigada() {
+				go e.pw().encerrou(ev.CallID)
+			}
 			// COEX/multi-device: numa chamada INBOUND, o WhatsApp manda CallTerminate
 			// reason=rejected_elsewhere quando OUTRO device (coex/primário) RECUSA — mas a
 			// chamada CONTINUA tocando pra NÓS. Encerrar aqui mata o toque antes do atendente
@@ -281,6 +296,14 @@ func (e *engine) onOffer(ev *events.CallOffer) {
 	// encosta no nó que a chamada real usa. Ligado por WHATSMEOW_DUMP_CALL_STANZAS=1.
 	if os.Getenv("WHATSMEOW_DUMP_CALL_STANZAS") == "1" {
 		go dumpOfertaProWasm(e.c.log, ev, callKey)
+	}
+	// ⭐ PONTE: com WHATSMEOW_WASM_BRIDGE=1 quem atende a chamada RECEBIDA é o motor
+	// original (whatsapp.wasm) no sidecar, e o meowcaller sai de cena — é a única forma
+	// de o relay entregar a voz do cliente pra gente. Desligada (padrão), segue o fluxo
+	// de sempre e nada muda. O outbound nunca passa por aqui.
+	if pontewasmLigada() {
+		e.pw().oferta(ev, callKey)
+		return
 	}
 	e.c.diag.Emit("keying", map[string]any{
 		"call_id": ev.CallID, "direction": "in", "from": ev.From.String(),
@@ -857,10 +880,19 @@ func (e *engine) installCallAckHook() {
 		if node.AttrGetter().String("class") != "call" {
 			return
 		}
+		if pontewasmLigada() {
+			go e.pw().ackBruto(node, "")
+		}
 		e.onCallAck(node)
 	}
 	origCall := handlers["call"]
 	handlers["call"] = func(ctx context.Context, node *waBinary.Node) {
+		// Com a ponte ligada, o motor precisa ver TODOS os nós da chamada (relay,
+		// transport, terminate…) no formato cru. Só repassa — o fluxo normal continua,
+		// e sem entrada de chamada no meowcaller ele não faz nada com esses nós.
+		if pontewasmLigada() {
+			go e.pw().sinalBruto(node)
+		}
 		// onCallRaw returns true when it fully handled the node (incl. its own ack), so
 		// whatsmeow's generic typeless ack is skipped — the <video> upgrade needs a typed
 		// type="video" ack, which a bare ack does not satisfy (the peer reverts otherwise).
