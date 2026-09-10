@@ -1135,6 +1135,12 @@ type relayData struct {
 	// JIDs de participante COM DEVICE, do <relay>: <user><device jid="..."> e <participant jid="...">.
 	// É daqui que sai o SSRC do peer (ver deriveParticipantePeer) — não do "from" do offer.
 	participantJIDs []string
+	// ⭐ pids que a PRÓPRIA oferta declara: <relay peer_pid="1" self_pid="2">. A inscrição no
+	// relay sempre mandou 0,0 (herdado do WaCalls, que também não recebe áudio no inbound) —
+	// ou seja, a gente pedia o stream do participante 0 quando o chamador é o 1. Nunca foi
+	// testado com os pids de verdade. Ligar com WHATSMEOW_SUB_PIDS=1.
+	selfPid uint32
+	peerPid uint32
 }
 
 func nodeBytes(n *waBinary.Node) []byte {
@@ -1245,6 +1251,12 @@ func parseRelayData(node *waBinary.Node) *relayData {
 	}
 	rd.relayTokens = parseIndexedTokens(node, "token")
 	rd.authTokens = parseIndexedTokens(node, "auth_token")
+	if v, err := strconv.ParseUint(node.AttrGetter().OptionalString("self_pid"), 10, 32); err == nil {
+		rd.selfPid = uint32(v)
+	}
+	if v, err := strconv.ParseUint(node.AttrGetter().OptionalString("peer_pid"), 10, 32); err == nil {
+		rd.peerPid = uint32(v)
+	}
 
 	kids := node.GetChildren()
 	peerPID := node.AttrGetter().String("peer_pid")

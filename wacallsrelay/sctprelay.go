@@ -76,6 +76,8 @@ type SctpRelayManager struct {
 
 	audioSsrc        uint32
 	subscriptionSsrc uint32
+	selfPid          uint32 // participant-id nosso, vindo de <relay self_pid> (0 = comportamento antigo)
+	peerPid          uint32 // participant-id do chamador, vindo de <relay peer_pid>
 	activeConnID     string // relay que entrega o media do peer — alvo do uplink de VÍDEO (evita broadcast pros 3)
 
 	onConnected func(ip string, port int)
@@ -98,6 +100,10 @@ func (m *SctpRelayManager) SetSsrc(ssrc uint32) { m.audioSsrc = ssrc }
 var expUmaVez sync.Once
 
 func (m *SctpRelayManager) SetSubscriptionSsrc(ssrc uint32) { m.subscriptionSsrc = ssrc }
+
+// SetPids informa os participant-ids que a oferta declarou (<relay self_pid peer_pid>).
+// Sem isso a inscrição vai com 0,0 — pedindo o stream de um participante que não existe.
+func (m *SctpRelayManager) SetPids(selfPid, peerPid uint32) { m.selfPid, m.peerPid = selfPid, peerPid }
 
 func (m *SctpRelayManager) SetOnConnected(fn func(ip string, port int)) { m.onConnected = fn }
 
@@ -330,7 +336,7 @@ func (m *SctpRelayManager) sendStunRegistration(conn *relayConnection) {
 			if m.subscriptionSsrc != 0 {
 				peerSsrcs = []uint32{m.subscriptionSsrc}
 			}
-			ssrcList := BuildSSRCSubscriptionList([]uint32{m.audioSsrc}, peerSsrcs, 0, 0)
+			ssrcList := BuildSSRCSubscriptionList([]uint32{m.audioSsrc}, peerSsrcs, int(m.selfPid), int(m.peerPid))
 			m.sendRaw(conn, BuildAllocateForRelay(info.RawToken, ssrcList, hmacKey, info.IP, info.Port))
 		}
 	}

@@ -218,7 +218,8 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		selfList = append(selfList, selfVideoSsrc)
 		peerList = append(peerList, peerVideoSsrc)
 	}
-	ssrcList := stun.BuildWasmSsrcSubscriptionList(selfList, peerList, 0, 0)
+	sPid, pPid := pidsDaInscricao(rd)
+	ssrcList := stun.BuildWasmSsrcSubscriptionList(selfList, peerList, sPid, pPid)
 
 	// MULTI-RELAY: escolhe os endpoints. INBOUND → TODOS os relays com endereço, INCLUSIVE o
 	// FNA. O uplink do caller cai justamente no relay que ele marcou is_fna=1 (upstream #9,
@@ -321,7 +322,8 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		}
 		var atx [12]byte
 		_, _ = rand.Read(atx[:])
-		sl := stun.BuildWasmSsrcSubscriptionList([]uint32{ssrc}, []uint32{ps}, 0, 0)
+		sPidR, pPidR := pidsDaInscricao(rd)
+		sl := stun.BuildWasmSsrcSubscriptionList([]uint32{ssrc}, []uint32{ps}, sPidR, pPidR)
 		return stun.BuildWasmStunAllocateRequest(atx, rd.relayTokens[ep.tokenID], exor, sl, rd.relayKeyASCII, log)
 	}
 
@@ -893,6 +895,11 @@ func (e *engine) runMediaWacalls(ctx context.Context, callID string, call *Call,
 	mgr := wacallsrelay.NewSctpRelayManager(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
 	mgr.SetSsrc(ssrc)
 	mgr.SetSubscriptionSsrc(peerSsrc)
+	if sPid, pPid := pidsDaInscricao(rd); sPid != 0 || pPid != 0 {
+		mgr.SetPids(sPid, pPid)
+		log.Info().Uint32("self_pid", sPid).Uint32("peer_pid", pPid).
+			Msg("[EXPERIMENTO] inscrição no relay com os pids DA OFERTA (antes ia 0,0)")
+	}
 	defer mgr.Cleanup()
 
 	var rtpIn, rtpSeen, nonRtp atomic.Uint64
@@ -1162,4 +1169,18 @@ func rmsFloat32(f []float32) float64 {
 		sum += float64(s) * float64(s)
 	}
 	return math.Sqrt(sum / float64(len(f)))
+}
+
+// pidsDaInscricao devolve os participant-ids que vão na lista de inscrição do relay.
+//
+// A inscrição sempre mandou 0,0 — herdado do WaCalls, que também não recebe áudio no
+// inbound. Só que a PRÓPRIA oferta declara quem é quem: <relay peer_pid="1" self_pid="2">.
+// Pedir o stream do participante 0 quando o chamador é o 1 pode ser exatamente o motivo de
+// o relay nunca encaminhar nada. Nunca foi testado com os pids de verdade.
+// WHATSMEOW_SUB_PIDS=1 liga; desligado (padrão), continua 0,0 como sempre.
+func pidsDaInscricao(rd *relayData) (uint32, uint32) {
+	if rd == nil || os.Getenv("WHATSMEOW_SUB_PIDS") != "1" {
+		return 0, 0
+	}
+	return rd.selfPid, rd.peerPid
 }
