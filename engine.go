@@ -885,6 +885,17 @@ func (e *engine) installCallAckHook() {
 		}
 		e.onCallAck(node)
 	}
+	// Recibos de chamada (<receipt> com call-id): o SheIITear repassa e a ponte não
+	// repassava. Preserva o handler original do whatsmeow (recibos de mensagem).
+	origReceipt := handlers["receipt"]
+	handlers["receipt"] = func(ctx context.Context, node *waBinary.Node) {
+		if pontewasmLigada() {
+			go e.pw().recibo(node)
+		}
+		if origReceipt != nil {
+			origReceipt(ctx, node)
+		}
+	}
 	origCall := handlers["call"]
 	handlers["call"] = func(ctx context.Context, node *waBinary.Node) {
 		// Com a ponte ligada, o motor precisa ver TODOS os nós da chamada (relay,

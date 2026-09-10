@@ -225,6 +225,42 @@ func (p *pontewasm) ackBruto(node *waBinary.Node, msgType string) {
 	})
 }
 
+// recibo entrega ao motor um <receipt> de chamada — o SheIITear repassa esses (CB:receipt)
+// e a ponte não repassava. Vai o nó INTEIRO, não o filho (é o que handleSignalingReceipt
+// espera).
+func (p *pontewasm) recibo(node *waBinary.Node) {
+	if node == nil {
+		return
+	}
+	kids := node.GetChildren()
+	if len(kids) == 0 {
+		return
+	}
+	cag := kids[0].AttrGetter()
+	callID := cag.OptionalString("call-id")
+	if callID == "" {
+		callID = cag.OptionalString("call_id")
+	}
+	if callID == "" {
+		return // recibo de mensagem comum, não é da chamada
+	}
+	raw, err := waBinary.Marshal(*node)
+	if err != nil {
+		return
+	}
+	ag := node.AttrGetter()
+	peer := cag.OptionalString("call-creator")
+	if peer == "" {
+		peer = ag.String("from")
+	}
+	p.log.Info().Str("call_id", callID).Msg("⬇️ recibo de chamada repassado ao motor")
+	_, _ = p.postar("/signal", map[string]any{
+		"tipo": "receipt", "callId": callID,
+		"payloadWasm": base64.StdEncoding.EncodeToString(raw),
+		"peerJid":     peer,
+	})
+}
+
 // laçoDeSaída fica pendurado no /out do sidecar e envia o que o motor produzir.
 func (p *pontewasm) laçoDeSaída() {
 	for {
@@ -329,8 +365,12 @@ func (p *pontewasm) enviarResposta(r saidaWasm) {
 		p.log.Error().Err(err).Str("tag", acao.Tag).Msg("envio da stanza do motor falhou")
 		return
 	}
+	filhos := make([]string, 0, 4)
+	for _, f := range acao.GetChildren() {
+		filhos = append(filhos, f.Tag)
+	}
 	p.log.Info().Str("tag", acao.Tag).Str("call_id", callID).Str("to", para.String()).
-		Msg("⬆️ stanza do motor enviada")
+		Strs("dentro", filhos).Msg("⬆️ stanza do motor enviada")
 
 	// O <ack> do servidor é o que pode TRAZER MAIS RELAYS — é onde o inbound descobre o
 	// relay do chamador (o `fccm1c01` que aparece no relaylatency e não está na nossa
