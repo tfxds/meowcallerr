@@ -179,7 +179,20 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	if err != nil {
 		return err
 	}
-	peerSsrc, err := rtp.DeriveWasmParticipantSsrc(callID, rtp.FormatE2ESrtpParticipantID(peerLID), 0, log)
+	// ⭐ SSRC do peer: sai do participante COM DEVICE anunciado no <relay>, não do "from" do
+	// offer. Comparação com o WaCalls (que funciona) mostrou que ele deriva de
+	// relayData.ParticipantJids; a gente derivava do peerLID e o número NUNCA batia com o
+	// stream real — medido em 5 chamadas seguidas (derivado 0xfc4be103 × real 0xefbb6248 etc).
+	// Assinando um SSRC que não existe, o relay manda o broadcast inicial e para: os "8 pacotes
+	// em 38 segundos" e o atendente sem ouvir o cliente.
+	lidParaSsrc := peerLID
+	if p := deriveParticipantePeer(rd, selfLID); p != "" {
+		lidParaSsrc = p
+		log.Info().Str("peer_do_relay", p).Str("peer_do_offer", peerLID).Msg("[SSRC] peer veio da lista de participantes do relay")
+	} else {
+		log.Warn().Str("peer_do_offer", peerLID).Msg("[SSRC] <relay> sem lista de participantes — caindo no peer do offer")
+	}
+	peerSsrc, err := rtp.DeriveWasmParticipantSsrc(callID, rtp.FormatE2ESrtpParticipantID(lidParaSsrc), 0, log)
 	if err != nil {
 		return err
 	}
@@ -194,7 +207,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	var peerVideoSsrc uint32
 	if isVideoCall {
 		selfVideoSsrc, _ := rtp.DeriveWasmParticipantSsrc(callID, rtp.FormatE2ESrtpParticipantID(selfLID), rtp.VideoSlotWord, log)
-		peerVideoSsrc, _ = rtp.DeriveWasmParticipantSsrc(callID, rtp.FormatE2ESrtpParticipantID(peerLID), rtp.VideoSlotWord, log)
+		peerVideoSsrc, _ = rtp.DeriveWasmParticipantSsrc(callID, rtp.FormatE2ESrtpParticipantID(lidParaSsrc), rtp.VideoSlotWord, log)
 		selfList = append(selfList, selfVideoSsrc)
 		peerList = append(peerList, peerVideoSsrc)
 	}
@@ -797,7 +810,20 @@ func (e *engine) runMediaWacalls(ctx context.Context, callID string, call *Call,
 	if err != nil {
 		return err
 	}
-	peerSsrc, err := rtp.DeriveWasmParticipantSsrc(callID, rtp.FormatE2ESrtpParticipantID(peerLID), 0, log)
+	// ⭐ SSRC do peer: sai do participante COM DEVICE anunciado no <relay>, não do "from" do
+	// offer. Comparação com o WaCalls (que funciona) mostrou que ele deriva de
+	// relayData.ParticipantJids; a gente derivava do peerLID e o número NUNCA batia com o
+	// stream real — medido em 5 chamadas seguidas (derivado 0xfc4be103 × real 0xefbb6248 etc).
+	// Assinando um SSRC que não existe, o relay manda o broadcast inicial e para: os "8 pacotes
+	// em 38 segundos" e o atendente sem ouvir o cliente.
+	lidParaSsrc := peerLID
+	if p := deriveParticipantePeer(rd, selfLID); p != "" {
+		lidParaSsrc = p
+		log.Info().Str("peer_do_relay", p).Str("peer_do_offer", peerLID).Msg("[SSRC] peer veio da lista de participantes do relay")
+	} else {
+		log.Warn().Str("peer_do_offer", peerLID).Msg("[SSRC] <relay> sem lista de participantes — caindo no peer do offer")
+	}
+	peerSsrc, err := rtp.DeriveWasmParticipantSsrc(callID, rtp.FormatE2ESrtpParticipantID(lidParaSsrc), 0, log)
 	if err != nil {
 		return err
 	}

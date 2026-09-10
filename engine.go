@@ -991,6 +991,9 @@ type relayData struct {
 	authTokens    [][]byte // indexed <auth_token id=…> — base of the synthetic ICE ufrag
 	endpoints     []relayEndpoint
 	peerJID       types.JID
+	// JIDs de participante COM DEVICE, do <relay>: <user><device jid="..."> e <participant jid="...">.
+	// É daqui que sai o SSRC do peer (ver deriveParticipantePeer) — não do "from" do offer.
+	participantJIDs []string
 }
 
 func nodeBytes(n *waBinary.Node) []byte {
@@ -1106,6 +1109,23 @@ func parseRelayData(node *waBinary.Node) *relayData {
 	peerPID := node.AttrGetter().String("peer_pid")
 	for i := range kids {
 		child := &kids[i]
+		// Lista de participantes com device — o WaCalls monta a mesma lista (relayack.go
+		// addParticipant) e é DELA que ele tira o SSRC do peer. Sem isso a gente derivava do
+		// "from" do offer e o número nunca batia com o stream real.
+		if child.Tag == "user" {
+			for _, dev := range child.GetChildren() {
+				if dev.Tag == "device" {
+					if j := dev.AttrGetter().String("jid"); j != "" {
+						rd.participantJIDs = append(rd.participantJIDs, j)
+					}
+				}
+			}
+		}
+		if child.Tag == "participant" {
+			if j := child.AttrGetter().String("jid"); j != "" {
+				rd.participantJIDs = append(rd.participantJIDs, j)
+			}
+		}
 		if child.Tag == "participant" && peerPID != "" && child.AttrGetter().String("pid") == peerPID {
 			rd.peerJID = child.AttrGetter().JID("jid")
 			continue
@@ -1137,6 +1157,39 @@ func parseRelayData(node *waBinary.Node) *relayData {
 // any non-FNA, else the first. For an inbound call the caller's uplink RTP lands on their
 // FNA-marked relay, so we must allocate on that same relay or the relay never bridges the
 // peer's media (the callee connects but hears nothing).
+// garanteDevice devolve o JID com device explícito (":0" quando não veio nenhum) — espelha
+// ensureDeviceJid do WaCalls (internal/voip/call/helpers.go).
+func garanteDevice(jid string) string {
+	if i := strings.Index(jid, ":"); i >= 0 {
+		if at := strings.Index(jid, "@"); at > i {
+			return jid
+		}
+	}
+	return strings.Replace(jid, "@", ":0@", 1)
+}
+
+// baseJID: só o usuário, sem device e sem domínio.
+func baseJID(jid string) string {
+	u, _, _ := strings.Cut(jid, "@")
+	u, _, _ = strings.Cut(u, ":")
+	return u
+}
+
+// deriveParticipantePeer acha, na lista de participantes do <relay>, o primeiro que NÃO é a
+// gente — é o JID (com device) de onde sai o SSRC do stream do peer. Vazio se a lista não veio.
+func deriveParticipantePeer(rd *relayData, selfLID string) string {
+	if rd == nil || len(rd.participantJIDs) == 0 {
+		return ""
+	}
+	meu := baseJID(selfLID)
+	for _, j := range rd.participantJIDs {
+		if baseJID(j) != meu {
+			return garanteDevice(j)
+		}
+	}
+	return ""
+}
+
 func getMediaRelayEndpoint(rd *relayData, inbound bool) *relayEndpoint {
 	if inbound {
 		for i := range rd.endpoints {
