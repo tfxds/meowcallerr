@@ -200,19 +200,19 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	}
 	ssrcList := stun.BuildWasmSsrcSubscriptionList(selfList, peerList, 0, 0)
 
-	// MULTI-RELAY: escolhe os endpoints. INBOUND → TODOS os relays não-FNA com endereço
-	// (a captura prova que o WaCalls conecta em TODOS e o peer responde só por UM; conectar
-	// em 1 só e errar qual = "1 pacote e morre"). OUTBOUND → 1 só (getMediaRelayEndpoint),
-	// comportamento atual INTACTO.
+	// MULTI-RELAY: escolhe os endpoints. INBOUND → TODOS os relays com endereço, INCLUSIVE o
+	// FNA. O uplink do caller cai justamente no relay que ele marcou is_fna=1 (upstream #9,
+	// "the callee hears nothing"): pular o FNA era assinar um relay que o peer nunca alimenta,
+	// e daí o "1 pacote e morre". OUTBOUND → 1 só (getMediaRelayEndpoint), intacto.
 	var endpoints []*relayEndpoint
 	if isInbound {
 		for i := range rd.endpoints {
 			ep := &rd.endpoints[i]
-			if !ep.isFNA && len(ep.addresses) > 0 {
+			if len(ep.addresses) > 0 {
 				endpoints = append(endpoints, ep)
 			}
 		}
-	} else if ep := getMediaRelayEndpoint(rd); ep != nil {
+	} else if ep := getMediaRelayEndpoint(rd, false); ep != nil {
 		endpoints = append(endpoints, ep)
 	}
 	if len(endpoints) == 0 {
