@@ -301,7 +301,7 @@ func (e *engine) onOffer(ev *events.CallOffer) {
 	// original (whatsapp.wasm) no sidecar, e o meowcaller sai de cena — é a única forma
 	// de o relay entregar a voz do cliente pra gente. Desligada (padrão), segue o fluxo
 	// de sempre e nada muda. O outbound nunca passa por aqui.
-	if pontewasmLigada() {
+	if pontewasmLigada() && e.pontewasmAtendeEsteNumero() {
 		peerP := ev.CallCreator
 		if peerP.IsEmpty() {
 			peerP = ev.From

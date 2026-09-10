@@ -38,6 +38,25 @@ import (
 // pontewasmLigada diz se a ponte está habilitada. Padrão: desligada.
 func pontewasmLigada() bool { return os.Getenv("WHATSMEOW_WASM_BRIDGE") == "1" }
 
+// pontewasmAtendeEsteNumero: o sidecar roda com a identidade de UM número só
+// (SELF_PN_DEV/SELF_LID). Entregar a ele a chamada de OUTRO número daria uma chamada muda
+// — pior que o caminho antigo. WHATSMEOW_WASM_BRIDGE_JID lista os números (só dígitos,
+// separados por vírgula) que passam pela ponte; os demais seguem pelo meowcaller.
+// Vazio = todos (útil só em bancada, com uma instância só).
+func (e *engine) pontewasmAtendeEsteNumero() bool {
+	permitidos := strings.TrimSpace(os.Getenv("WHATSMEOW_WASM_BRIDGE_JID"))
+	if permitidos == "" {
+		return true
+	}
+	meu := e.c.wa.Store.GetJID().User
+	for _, n := range strings.Split(permitidos, ",") {
+		if strings.TrimSpace(n) == meu {
+			return true
+		}
+	}
+	return false
+}
+
 func pontewasmURL() string {
 	if u := strings.TrimRight(os.Getenv("WHATSMEOW_WASM_BRIDGE_URL"), "/"); u != "" {
 		return u
