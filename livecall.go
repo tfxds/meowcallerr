@@ -137,6 +137,17 @@ func (c *Call) onVideoStateFn() func(VideoState) {
 // NOT VALIDATED: the video send media path is unproven.
 func (c *Call) SendVideo(accessUnit []byte) error { return c.eng.sendVideoFrame(c.id, accessUnit) }
 
+// SetVideoOrientation informa como o peer deve GIRAR o nosso vídeo, em quartos de volta no
+// sentido horário (0 = em pé, 1 = 90°, 2 = 180°, 3 = 270°). Carimba os bits CVO em cada
+// pacote RTP — que é por onde o peer realmente decide — e anuncia na stanza <video>.
+//
+// Sem chamar isto a rotação fica 0 e o vídeo vai como for capturado: certo pra câmera em pé,
+// deitado pra quem gira o aparelho. Quem sabe a orientação é a origem do vídeo (o navegador
+// do atendente), então é ela que precisa chamar.
+func (c *Call) SetVideoOrientation(quartosDeVolta int) error {
+	return c.eng.setVideoOrientation(c.id, quartosDeVolta)
+}
+
 // OnReady registers a callback fired once media is flowing (relay bound, first frames
 // exchanged).
 func (c *Call) OnReady(fn func()) {

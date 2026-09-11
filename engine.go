@@ -81,8 +81,9 @@ type engineCall struct {
 	// celular reage mal: a câmera do chamador continua, mas o MICROFONE dele fica mudo a
 	// chamada inteira. pendingVideoReply guarda um upgrade de vídeo que chegou cedo demais
 	// (dentro da janela em que o accept espera o mute_v2) pra responder depois do accept.
-	acceptSent        bool
-	pendingVideoReply bool
+	acceptSent              bool
+	pendingVideoReply       bool
+	pendingVideoOrientation *int
 }
 
 // newEngine creates the engine for a Client.
@@ -181,6 +182,54 @@ func (e *engine) sendVideoFrame(callID string, au []byte) error {
 	}
 	vs.send(au)
 	return nil
+}
+
+// setVideoOrientation grava a rotação do NOSSO vídeo (quartos de volta no sentido horário)
+// em dois lugares que precisam concordar: os bits CVO carimbados em cada pacote RTP, que é
+// por onde o peer realmente decide como girar a imagem, e a stanza <video device_orientation>,
+// que é o anúncio no nível da sinalização.
+//
+// A stanza respeita a mesma ordem do upgrade de vídeo: se o nosso <accept> ainda não saiu
+// (ele espera o mute_v2 + o atendente pegar), fica guardada e o sendAccept solta depois —
+// mandar estado de vídeo antes do accept emudece o microfone do chamador.
+func (e *engine) setVideoOrientation(callID string, orientation int) error {
+	orientation &= 0x03
+	e.mu.Lock()
+	m := e.calls[callID]
+	if m == nil {
+		e.mu.Unlock()
+		return errors.New("meowcaller: unknown call")
+	}
+	// Os bits in-band podem ser gravados a qualquer momento: eles só aparecem no fio
+	// quando um quadro for enviado, o que nunca acontece antes da mídia subir.
+	vs := m.videoTx
+	cedoDemais := m.direction == CallDirectionIncoming && !m.acceptSent
+	if cedoDemais {
+		v := orientation
+		m.pendingVideoOrientation = &v
+	}
+	to, creator := m.from, m.creator
+	e.mu.Unlock()
+
+	vs.setOrientation(orientation)
+
+	if cedoDemais {
+		e.c.log.Info().Str("call_id", callID).Int("orientacao", orientation).
+			Msg("[VIDEO-ORDEM] orientação chegou antes do accept — stanza adiada")
+		return nil
+	}
+	e.anunciaOrientacao(callID, to, creator, orientation)
+	return nil
+}
+
+// anunciaOrientacao manda a stanza <video state=1 device_orientation=N>.
+// Só deve ser chamada DEPOIS que o <accept> saiu — ver setVideoOrientation.
+func (e *engine) anunciaOrientacao(callID string, to, creator types.JID, orientation int) {
+	node := signaling.BuildVideoState(callID, to, creator, e.c.wa.GenerateMessageID(),
+		signaling.VideoStateActive, orientation, signaling.VideoCodecH264)
+	if err := e.c.wa.DangerousInternals().SendNode(context.Background(), node); err != nil {
+		e.c.log.Warn().Err(err).Str("call_id", callID).Msg("send <video device_orientation> failed")
+	}
 }
 
 // placeCall resolves target to a LID, builds and sends the <offer>, registers the Call,
@@ -603,12 +652,21 @@ func (e *engine) sendAccept(callID string, to, creator types.JID) {
 	// O accept saiu no fio: a partir daqui stanza de vídeo está na ordem certa.
 	e.mu.Lock()
 	var soltarVideo bool
+	var soltarOrientacao *int
 	if atual := e.calls[callID]; atual == m {
 		atual.acceptSent = true
 		soltarVideo = atual.pendingVideoReply
 		atual.pendingVideoReply = false
+		soltarOrientacao = atual.pendingVideoOrientation
+		atual.pendingVideoOrientation = nil
 	}
 	e.mu.Unlock()
+
+	if soltarOrientacao != nil {
+		e.c.log.Info().Str("call_id", callID).Int("orientacao", *soltarOrientacao).
+			Msg("[VIDEO-ORDEM] soltando a orientação adiada")
+		e.anunciaOrientacao(callID, to, creator, *soltarOrientacao)
+	}
 
 	// Vídeo from-start: depois do accept com <video>, o peer espera o callee mandar
 	// <video state=1> ("câmera pronta"). Sem isso o peer dá timeout em ~1s e derruba.

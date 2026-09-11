@@ -1199,6 +1199,24 @@ type videoSender struct {
 	seq     uint16
 	ts      uint32
 	started bool
+
+	// Rotação CVO carimbada em todo pacote de vídeo que sai, em quartos de volta no
+	// sentido horário. Quem recebe renderiza POR ESTES BITS, não pela orientação que
+	// vai na stanza — deixar zerado mostra o nosso vídeo deitado no peer.
+	orientation  int
+	frameNumber  uint16
+	transportSeq uint16
+}
+
+// setOrientation define a rotação CVO dos próximos pacotes de vídeo (quartos de volta
+// no sentido horário: 0/1/2/3). Upstream: PR #26 do purpshell/meowcaller.
+func (vs *videoSender) setOrientation(orientation int) {
+	if vs == nil {
+		return
+	}
+	vs.mu.Lock()
+	vs.orientation = orientation & 0x03
+	vs.mu.Unlock()
 }
 
 // send fragments one Annex-B access unit into PT-97 RTP packets (marker on the last) and
@@ -1215,6 +1233,18 @@ func (vs *videoSender) send(au []byte) {
 	for _, n := range nalus {
 		payloads = append(payloads, rtp.PackageH264NALU(n)...)
 	}
+	// IDR = NALU tipo 5. Vai no MediaFrameInfo pra quem recebe saber que dá pra
+	// começar a decodificar por este quadro.
+	idr := false
+	for _, n := range nalus {
+		if len(n) > 0 && n[0]&0x1f == 5 {
+			idr = true
+			break
+		}
+	}
+	// Com a extensão desligada (WHATSMEOW_VIDEO_CVO=0) o VideoExtension fica nil e o
+	// pacote sai EXATAMENTE como saía antes desta mudança — reverter é uma variável.
+	comExtensao := os.Getenv("WHATSMEOW_VIDEO_CVO") != "0"
 	vs.mu.Lock()
 	defer vs.mu.Unlock()
 	if vs.ch == nil {
@@ -1232,6 +1262,26 @@ func (vs *videoSender) send(au []byte) {
 			Ssrc:           vs.ssrc,
 			Marker:         i == len(payloads)-1,
 		}
+		if comExtensao {
+			mfi := rtp.VideoMediaFrameInfoDelta
+			if idr {
+				mfi = rtp.VideoMediaFrameInfoIDR
+			}
+			// ⭐ Os DOIS BITS BAIXOS são a rotação CVO. É por eles que o peer decide
+			// como girar o nosso vídeo na tela — a orientação da stanza não manda.
+			mfi |= uint8(vs.orientation & 0x03)
+			var frameNumber *uint16
+			if i == 0 {
+				fn := vs.frameNumber
+				frameNumber = &fn
+			}
+			hdr.VideoExtension = &rtp.VideoRtpExtension{
+				MediaFrameInfo:    mfi,
+				FrameNumber:       frameNumber,
+				TransportSequence: vs.transportSeq,
+			}
+			vs.transportSeq++
+		}
 		vs.seq++
 		pkt, err := vs.pipe.ProtectRTP(&hdr, p)
 		if err != nil {
@@ -1241,6 +1291,8 @@ func (vs *videoSender) send(au []byte) {
 			return
 		}
 	}
+	// Um número de quadro por access unit (vai só no primeiro pacote de cada um).
+	vs.frameNumber++
 }
 
 // rmsFloat32 returns the root-mean-square level of a PCM frame, a cheap loudness

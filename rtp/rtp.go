@@ -101,6 +101,53 @@ func EstimateSrtpRtpWireBytes(opusPayload []byte) int {
 	return headerSize + len(opusPayload) + tagLen
 }
 
+// Bits de MediaFrameInfo da extensão de vídeo. Os DOIS BITS BAIXOS são a rotação CVO
+// (quartos de volta no sentido horário, TS 26.114) — ver VideoRtpExtension.DisplayOrientation.
+const (
+	VideoMediaFrameInfoIDR   uint8 = 0x08
+	VideoMediaFrameInfoDelta uint8 = 0x20
+)
+
+// VideoRtpExtension é o conjunto de metadados que o WhatsApp manda na extensão 0xdebe dos
+// pacotes de VÍDEO — diferente do áudio, que usa uma única palavra de 4 bytes (ExtensionWord).
+type VideoRtpExtension struct {
+	MediaFrameInfo    uint8
+	FrameNumber       *uint16
+	InitialBandwidth  uint16
+	ShortOffset       int16
+	TransportSequence uint16
+}
+
+// DisplayOrientation devolve a rotação CVO em quartos de volta no sentido horário.
+// Fonte: ETSI TS 26.114 (https://www.etsi.org/deliver/etsi_ts/126100_126199/126114/15.05.00_60/ts_126114v150500p.pdf)
+func (e *VideoRtpExtension) DisplayOrientation() int {
+	return int(e.MediaFrameInfo & 0x03)
+}
+
+// encode serializa a extensão no formato de cabeçalho de 1 byte (id<<4 | tamanho-1),
+// com padding até múltiplo de 4.
+func (e *VideoRtpExtension) encode() []byte {
+	frameInfoLength := 1
+	if e.FrameNumber != nil {
+		frameInfoLength = 3
+	}
+	ext := make([]byte, 0, 16)
+	ext = append(ext, 0x30|byte(frameInfoLength-1), e.MediaFrameInfo)
+	if e.FrameNumber != nil {
+		ext = binary.BigEndian.AppendUint16(ext, *e.FrameNumber)
+	}
+	ext = append(ext, 0x51)
+	ext = binary.BigEndian.AppendUint16(ext, e.InitialBandwidth)
+	ext = append(ext, 0x61)
+	ext = binary.BigEndian.AppendUint16(ext, uint16(e.ShortOffset))
+	ext = append(ext, 0x91)
+	ext = binary.BigEndian.AppendUint16(ext, e.TransportSequence)
+	for len(ext)%4 != 0 {
+		ext = append(ext, 0)
+	}
+	return ext
+}
+
 // RtpHeader is the fixed RTP header plus an optional 0xdebe extension word.
 type RtpHeader struct {
 	Marker         bool
@@ -108,12 +155,18 @@ type RtpHeader struct {
 	SequenceNumber uint16
 	Timestamp      uint32
 	Ssrc           uint32
-	ExtensionWord  *uint32 // nil = no 0xdebe extension word
+	ExtensionWord  *uint32            // nil = no 0xdebe extension word (áudio)
+	VideoExtension *VideoRtpExtension // nil = sem bloco de extensão de vídeo
 }
 
-// ByteSize is the on-wire header size (16, or 20 with an extension word).
+// ByteSize is the on-wire header size (16, 20 com a palavra de áudio, ou 16+bloco no vídeo).
 func (h *RtpHeader) ByteSize() int {
 	// Source of truth: https://github.com/oxidezap/whatsapp-rust/blob/41095d4e6ba4610e054e9ede3af1d5e88a83faee/wacore/src/voip/rtp.rs#L93-L99
+	// O vídeo vem PRIMEIRO: quando VideoExtension é nil o caminho do áudio fica idêntico
+	// byte a byte ao de antes, que é o que mantém a voz (duramente conquistada) intocada.
+	if h.VideoExtension != nil {
+		return WhatsappRtpHeaderSize + len(h.VideoExtension.encode())
+	}
 	if h.ExtensionWord != nil {
 		return WhatsappRtpHeaderDtxSize
 	}
@@ -190,10 +243,17 @@ func EncodeRtpHeader(header *RtpHeader) []byte {
 	if size >= 16 {
 		binary.BigEndian.PutUint16(buf[12:14], WhatsappRtpExtensionProfile)
 		var extWords uint16
-		if header.ExtensionWord != nil {
+		switch {
+		case header.VideoExtension != nil:
+			extWords = uint16(len(header.VideoExtension.encode()) / 4)
+		case header.ExtensionWord != nil:
 			extWords = 1
 		}
 		binary.BigEndian.PutUint16(buf[14:16], extWords)
+	}
+	if header.VideoExtension != nil {
+		copy(buf[16:], header.VideoExtension.encode())
+		return buf
 	}
 	if size >= 20 && header.ExtensionWord != nil {
 		binary.BigEndian.PutUint32(buf[16:20], *header.ExtensionWord)
