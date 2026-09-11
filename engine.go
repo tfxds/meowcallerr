@@ -75,6 +75,14 @@ type engineCall struct {
 	pickupDone    bool
 	acceptTo      types.JID
 	acceptCreator types.JID
+
+	// acceptSent vira true quando o <accept> REALMENTE saiu no fio. Stanza de estado de
+	// vídeo mandada antes dele é uma sequência que cliente nenhum de verdade produz, e o
+	// celular reage mal: a câmera do chamador continua, mas o MICROFONE dele fica mudo a
+	// chamada inteira. pendingVideoReply guarda um upgrade de vídeo que chegou cedo demais
+	// (dentro da janela em que o accept espera o mute_v2) pra responder depois do accept.
+	acceptSent        bool
+	pendingVideoReply bool
 }
 
 // newEngine creates the engine for a Client.
@@ -282,6 +290,26 @@ func (e *engine) onOffer(ev *events.CallOffer) {
 	if oag.OptionalString("is_call_ended") == "1" || oag.OptionalString("terminate_reason") != "" {
 		e.c.log.Warn().Str("call_id", ev.CallID).Msg("ignoring already-ended offer; not a live call")
 		return
+	}
+
+	// ⭐ FILA OFFLINE: ao reconectar, o servidor REENTREGA as stanzas de chamada que ficaram
+	// na fila enquanto estivemos fora — inclusive ofertas de minutos atrás cujo <terminate>
+	// vem logo atrás no MESMO lote. Tratar isso como chamada viva faz o sistema TOCAR por
+	// ligação que já acabou, e ainda corre com o terminate enfileirado (toca, o atendente
+	// corre pra atender, e a chamada some antes do accept sair).
+	//
+	// O atributo `e` do envelope é o tempo decorrido CALCULADO PELO SERVIDOR (0 na entrega ao
+	// vivo), então relógio local errado não dispara o filtro à toa. Acima do timeout de toque
+	// do próprio chamador (90s) a oferta não tem como ser atendida.
+	//
+	// Upstream: PR #26 do purpshell/meowcaller (validado contra um lote de 16 stanzas).
+	// WHATSMEOW_STALE_OFFER=0 desliga.
+	if raw := oag.OptionalString("e"); raw != "" && os.Getenv("WHATSMEOW_STALE_OFFER") != "0" {
+		if decorrido, err := strconv.Atoi(raw); err == nil && decorrido > 90 {
+			e.c.log.Warn().Str("call_id", ev.CallID).Int("decorrido_s", decorrido).
+				Msg("[OFERTA-VELHA] reentregue pela fila offline — ignorada (não tocar)")
+			return
+		}
 	}
 
 	callKey, err := decryptInboundCallKey(context.Background(), e.c.wa, ev)
@@ -572,6 +600,16 @@ func (e *engine) sendAccept(callID string, to, creator types.JID) {
 	}
 	e.c.log.Info().Str("call_id", callID).Msg("accepted (after mute_v2)")
 
+	// O accept saiu no fio: a partir daqui stanza de vídeo está na ordem certa.
+	e.mu.Lock()
+	var soltarVideo bool
+	if atual := e.calls[callID]; atual == m {
+		atual.acceptSent = true
+		soltarVideo = atual.pendingVideoReply
+		atual.pendingVideoReply = false
+	}
+	e.mu.Unlock()
+
 	// Vídeo from-start: depois do accept com <video>, o peer espera o callee mandar
 	// <video state=1> ("câmera pronta"). Sem isso o peer dá timeout em ~1s e derruba.
 	if isVideo {
@@ -582,6 +620,11 @@ func (e *engine) sendAccept(callID string, to, creator types.JID) {
 		} else {
 			e.c.log.Info().Str("call_id", callID).Msg("sent <video state=1> (callee video-ready)")
 		}
+	} else if soltarVideo {
+		// Upgrade de vídeo que chegou durante a espera do accept — responde agora, na ordem.
+		// Se a chamada já era de vídeo, o state=1 acima já serviu de resposta: não duplica.
+		e.c.log.Info().Str("call_id", callID).Msg("[VIDEO-ORDEM] soltando a resposta de upgrade adiada")
+		e.respondeUpgradeDeVideo(callID, to, creator)
 	}
 }
 
@@ -951,13 +994,36 @@ func (e *engine) onVideoStanza(v *waBinary.Node) {
 	// promoted to video server-side — the type="video" ack alone leaves the sender thinking
 	// the callee never entered video mode, so it reverts to state=0 after ~5s. NOT VALIDATED.
 	if state == signaling.VideoStateUpgrade {
-		reply := signaling.BuildVideoState(callID, m.from, m.creator, e.c.wa.GenerateMessageID(),
-			signaling.VideoStateActive, 0, signaling.VideoCodecH264)
-		if err := e.c.wa.DangerousInternals().SendNode(context.Background(), reply); err != nil {
-			e.c.log.Warn().Err(err).Str("call_id", callID).Msg("send video accept failed")
-		} else {
-			e.c.log.Info().Str("call_id", callID).Msg("sent <video> accept (state=1) for upgrade")
+		// ⭐ ORDEM IMPORTA: o nosso <accept> é ADIADO (espera o mute_v2 do chamador E o
+		// atendente pegar). Se o upgrade de vídeo cair dentro dessa janela e a gente
+		// responder na hora, sai uma stanza de vídeo ANTES do accept — sequência que
+		// cliente nenhum de verdade produz. O celular do chamador continua mandando
+		// vídeo, mas o MICROFONE dele fica mudo a chamada inteira. Guarda e deixa o
+		// sendAccept soltar na ordem certa. Upstream: PR #26 do purpshell/meowcaller.
+		e.mu.Lock()
+		cedoDemais := m.direction == CallDirectionIncoming && !m.acceptSent
+		if cedoDemais {
+			m.pendingVideoReply = true
 		}
+		e.mu.Unlock()
+		if cedoDemais {
+			e.c.log.Info().Str("call_id", callID).
+				Msg("[VIDEO-ORDEM] upgrade chegou antes do accept — resposta adiada pra depois dele")
+			return
+		}
+		e.respondeUpgradeDeVideo(callID, m.from, m.creator)
+	}
+}
+
+// respondeUpgradeDeVideo manda o nosso <video state=1> em resposta ao upgrade do peer.
+// Só deve ser chamada DEPOIS que o <accept> saiu — ver onVideoStanza.
+func (e *engine) respondeUpgradeDeVideo(callID string, to, creator types.JID) {
+	reply := signaling.BuildVideoState(callID, to, creator, e.c.wa.GenerateMessageID(),
+		signaling.VideoStateActive, 0, signaling.VideoCodecH264)
+	if err := e.c.wa.DangerousInternals().SendNode(context.Background(), reply); err != nil {
+		e.c.log.Warn().Err(err).Str("call_id", callID).Msg("send video accept failed")
+	} else {
+		e.c.log.Info().Str("call_id", callID).Msg("sent <video> accept (state=1) for upgrade")
 	}
 }
 
